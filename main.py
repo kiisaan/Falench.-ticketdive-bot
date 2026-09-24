@@ -35,57 +35,74 @@ def clean_title(raw_title):
     return title.strip(" :：-–|/／")
 
 
+def parse_datetime_str(raw_str):
+    """ISO文字列等を読みやすい形式（YYYY/MM/DD HH:MM）に変換"""
+    if not raw_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+        dt_jst = dt.astimezone(JST)
+        return dt_jst.strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        # パースできない場合は文字列のまま整形
+        return str(raw_str).replace("T", " ")[:16]
+
+
 def extract_sales_periods_from_json(html_content):
-    """Next.jsの組み込みJSONデータ(__NEXT_DATA__)から販売期間をダイレクト抽出"""
+    """Next.jsの内部JSON(__NEXT_DATA__)から販売期間情報をダイレクトパース"""
     periods = []
     try:
         soup = BeautifulSoup(html_content, "html.parser")
         script_tag = soup.find("script", id="__NEXT_DATA__")
         if script_tag and script_tag.string:
             data = json.loads(script_tag.string)
-            # 再帰的に salesStartAt / salesEndAt を探索
-            def find_dates(obj):
+
+            def search_tickets(obj):
                 if isinstance(obj, dict):
-                    if "salesStartAt" in obj or "salesEndAt" in obj:
-                        start = obj.get("salesStartAt", "")
-                        end = obj.get("salesEndAt", "")
-                        name = obj.get("name", "チケット")
-                        if start or end:
-                            # ISO8601フォーマット等を読みやすい形式に簡易整形
-                            s_fmt = start.replace("T", " ")[:16] if start else ""
-                            e_fmt = end.replace("T", " ")[:16] if end else ""
-                            period_str = f"{name}: {s_fmt} ～ {e_fmt}".strip(" ～")
+                    # TicketDiveのチケットオブジェクト構造を直接参照
+                    if "salesStartAt" in obj or "salesEndAt" in obj or "sales_start_at" in obj:
+                        name = obj.get("name") or obj.get("title") or "チケット"
+                        start = obj.get("salesStartAt") or obj.get("sales_start_at") or ""
+                        end = obj.get("salesEndAt") or obj.get("sales_end_at") or ""
+
+                        start_fmt = parse_datetime_str(start)
+                        end_fmt = parse_datetime_str(end)
+
+                        if start_fmt or end_fmt:
+                            period_str = f"{name}: {start_fmt} ～ {end_fmt}".strip(" ～")
                             if period_str not in periods:
                                 periods.append(period_str)
+
                     for v in obj.values():
-                        find_dates(v)
+                        search_tickets(v)
                 elif isinstance(obj, list):
                     for item in obj:
-                        find_dates(item)
+                        search_tickets(item)
 
-            find_dates(data)
+            search_tickets(data)
     except Exception as e:
-        print(f"JSON解析エラー: {e}")
+        print(f"JSONパース例外: {e}")
     return periods
 
 
 def fetch_event_details_with_browser(event_url):
-    """Playwrightを使ってブラウザ上で動的読み込み完了まで待機し、販売期間を精密抽出"""
+    """PlaywrightでTicketDiveの分割要素(DOM)から販売期間を統合・抽出"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
-            # ページアクセス
+            # ページ読み込み
             page.goto(event_url, wait_until="domcontentloaded", timeout=30000)
 
-            # TicketDiveの動的コンテンツ描画を待機（最大10秒）
+            # 動的描画（React/Next.js）の待機
             try:
-                page.wait_for_selector("text=/販売|受付|～|~/i", timeout=10000)
+                page.wait_for_selector("h1", timeout=8000)
             except Exception:
-                page.wait_for_timeout(4000)
+                pass
+            page.wait_for_timeout(3000)
 
-            # タイトル取得
+            # 1. タイトルの取得
             title = "イベント名称未設定"
             try:
                 h1_elem = page.query_selector("h1")
@@ -101,26 +118,47 @@ def fetch_event_details_with_browser(event_url):
                 if og_title and og_title.get("content"):
                     title = clean_title(og_title["content"])
 
-            body_text = page.inner_text("body")
             sales_periods = []
 
-            # 方法1: テキストからの正規表現マッチング
-            # 例: 2026/09/01 12:00 ～ 2026/09/10 23:59 や 09/01(月) 12:00 ~ 09/10(水) 23:59
-            pattern = r"(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}[\s\S]*?\d{1,2}:\d{2}\s*[\~～\-–—]\s*(?:\d{4}[/\.-])?\d{1,2}[/\.-]\d{1,2}[\s\S]*?\d{1,2}:\d{2})"
-            matches = re.findall(pattern, body_text)
-            
-            for m in matches:
-                clean_m = re.sub(r"\s+", " ", m).strip()
-                # 余計な長文をカット
-                if len(clean_m) < 80 and clean_m not in sales_periods:
-                    sales_periods.append(clean_m)
+            # 2. 画面上の要素からチケット枠ごとに販売期間を取得
+            # 日時表記と思われるテキストが含まれる要素を探索
+            body_text = page.inner_text("body")
+            lines = [l.strip() for l in body_text.splitlines() if l.strip()]
 
-            # 方法2: テキストで取れなかった場合、内部JSONから抽出
+            # 日時を表す行のインデックスを探す
+            date_line_indices = []
+            for idx, line in enumerate(lines):
+                if re.search(r"\d{2,4}[/\.-]\d{1,2}[/\.-]\d{1,2}|\d{1,2}:\d{2}", line):
+                    date_line_indices.append(idx)
+
+            # 近接する日時行・チケット情報を統合して期間文字列を作成
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                # 「販売」「受付」「先着」「抽選」「～」「~」などが含まれるか検証
+                if any(k in line for k in ["販売", "受付", "先着", "抽選", "チケット"]):
+                    # 周辺5行のテキストを取得
+                    chunk = lines[max(0, i-1):min(len(lines), i+6)]
+                    chunk_text = " ".join(chunk)
+
+                    # chunk内に日時が2つ以上（開始と終了）含まれていれば抽出
+                    dates_found = re.findall(r"(\d{2,4}[/\.-]\d{1,2}[/\.-]\d{1,2}(?:\(.*?\))?\s*\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日(?:\(.*?\))?\s*\d{1,2}:\d{2})", chunk_text)
+                    if len(dates_found) >= 2:
+                        period_candidate = f"{dates_found[0]} ～ {dates_found[1]}"
+                        if period_candidate not in sales_periods:
+                            sales_periods.append(period_candidate)
+                    elif len(dates_found) == 1 and any(s in chunk_text for s in ["～", "~", "-"]):
+                        # 1つの文脈の中に範囲指定がある場合
+                        if dates_found[0] not in sales_periods:
+                            sales_periods.append(chunk_text)
+                i += 1
+
+            # 3. DOMから取得できなかった場合、内部JSON(__NEXT_DATA__)を探索
             if not sales_periods:
                 html_content = page.content()
                 sales_periods = extract_sales_periods_from_json(html_content)
 
-            # 公演日時の抽出
+            # 4. 公演日時の抽出
             event_date = "情報なし"
             m_date = re.search(r"(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}|\d{1,2}月\d{1,2}日)", body_text)
             if m_date:
@@ -128,13 +166,20 @@ def fetch_event_details_with_browser(event_url):
 
             browser.close()
 
-            if not sales_periods:
-                sales_periods = ["公式ページをご確認ください"]
+            # 重複の削除と整理
+            clean_periods = []
+            for sp in sales_periods:
+                sp_clean = re.sub(r"\s+", " ", sp).strip()
+                if sp_clean and sp_clean not in clean_periods and len(sp_clean) < 100:
+                    clean_periods.append(sp_clean)
+
+            if not clean_periods:
+                clean_periods = ["公式ページをご確認ください"]
 
             return {
                 "title": title if title else "イベント名称未設定",
                 "event_date": event_date,
-                "sales_periods": sales_periods[:4],  # 最大4件
+                "sales_periods": clean_periods[:3],  # 最大3枠まで通知
                 "url": event_url
             }
 
@@ -175,7 +220,7 @@ def fetch_events():
 
 
 def load_seen_events():
-    """既読リストを安全に読み込み（空ファイル対応）"""
+    """既読リストの安全な読み込み"""
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
