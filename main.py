@@ -102,6 +102,30 @@ def format_dt_obj(dt_obj, include_time=True):
     return f"{dt_obj.month:02d}/{dt_obj.day:02d}（{weekdays[dt_obj.weekday()]}）"
 
 
+def extract_sales_periods_from_html(html_text):
+    """HTML全テキストから正規表現で直接販売期間（開始/終了日時）のペアを抽出"""
+    tickets = []
+
+    # パターン1: salesStartAt/salesEndAt または startAt/endAt パターン
+    patterns = [
+        r'(?:salesStartAt|sales_start_at|startAt)["\']?\s*:\s*["\']?([^"\',\}]+)["\']?[\s\S]*?(?:salesEndAt|sales_end_at|endAt)["\']?\s*:\s*["\']?([^"\',\}]+)["\']?',
+        r'["\']?salesStartAt["\']?\s*:\s*["\']?([^"\',\}]+)["\']?[\s\S]*?["\']?salesEndAt["\']?\s*:\s*["\']?([^"\',\}]+)["\']?',
+    ]
+
+    for pat in patterns:
+        matches = re.findall(pat, html_text)
+        for s_start, s_end in matches:
+            dt_s = parse_datetime_obj(s_start)
+            dt_e = parse_datetime_obj(s_end)
+            if dt_s and dt_e:
+                # 明らかに公演日（数日感の幅）ではなく販売枠らしい範囲（年が妥当か等）を検証
+                item = {"name": "", "start": dt_s, "end": dt_e}
+                if item not in tickets:
+                    tickets.append(item)
+
+    return tickets
+
+
 def search_json_recursive(data):
     """JSON構造内からチケット販売情報と公演日時を全探索"""
     tickets = []
@@ -110,13 +134,11 @@ def search_json_recursive(data):
     def walk(obj):
         if isinstance(obj, dict):
             # 公演日時の取得
-            for k in ["eventDate", "event_date", "openAt", "startAt"]:
+            for k in ["eventDate", "event_date", "openAt", "eventStartAt"]:
                 if k in obj and obj[k]:
-                    # チケットの販売開始日時と区別
-                    if "salesStartAt" not in obj and "sales_start_at" not in obj:
-                        dt = parse_datetime_obj(obj[k])
-                        if dt and dt not in event_dates:
-                            event_dates.append(dt)
+                    dt = parse_datetime_obj(obj[k])
+                    if dt and dt not in event_dates:
+                        event_dates.append(dt)
 
             # チケット販売枠の取得
             s_start = (
@@ -133,8 +155,7 @@ def search_json_recursive(data):
             )
             t_name = obj.get("name") or obj.get("title") or obj.get("ticketTypeName") or ""
 
-            # salesStartAt や salesEndAt があるオブジェクトを特定
-            if (obj.get("salesStartAt") or obj.get("sales_start_at")) and s_end:
+            if (obj.get("salesStartAt") or obj.get("sales_start_at") or obj.get("ticketSalesStartAt")) and s_end:
                 dt_s = parse_datetime_obj(s_start)
                 dt_e = parse_datetime_obj(s_end)
                 if dt_s and dt_e:
@@ -199,24 +220,23 @@ def process_extracted_periods(tickets, event_dates):
 
 
 def fetch_api_details(event_slug, headers):
-    """tRPC APIから直接イベント情報を取得（getBySlug / getById 対応）"""
+    """tRPC APIから直接イベント情報を取得（各種エンドポイント検証）"""
     api_headers = headers.copy()
     api_headers.update(
         {
             "x-trpc-source": "nextjs-react",
+            "Accept": "application/json",
             "Referer": f"https://ticketdive.com/event/{event_slug}",
         }
     )
 
-    # 1. getBySlug パターン
-    input_slug = urllib.parse.quote(f'{{"0":{{"json":{{"slug":"{event_slug}"}}}}}}')
-    url_slug = f"https://ticketdive.com/api/trpc/event.getBySlug?batch=1&input={input_slug}"
+    endpoints = [
+        f"https://ticketdive.com/api/trpc/event.getBySlug?input={urllib.parse.quote(f'{{\"json\":{{\"slug\":\"{event_slug}\"}}}}')}",
+        f"https://ticketdive.com/api/trpc/event.getBySlug?batch=1&input={urllib.parse.quote(f'{{\"0\":{{\"json\":{{\"slug\":\"{event_slug}\"}}}}}}')}",
+        f"https://ticketdive.com/api/trpc/event.getById?input={urllib.parse.quote(f'{{\"json\":{{\"id\":\"{event_slug}\"}}}}')}",
+    ]
 
-    # 2. getById パターン（スラッグがID風の場合）
-    input_id = urllib.parse.quote(f'{{"0":{{"json":{{"id":"{event_slug}"}}}}}}')
-    url_id = f"https://ticketdive.com/api/trpc/event.getById?batch=1&input={input_id}"
-
-    for api_url in [url_slug, url_id]:
+    for api_url in endpoints:
         try:
             res = requests.get(api_url, headers=api_headers, timeout=8)
             if res.status_code == 200:
@@ -269,15 +289,38 @@ def fetch_event_details(event_url, headers):
                 if dt_d:
                     extracted["event_date"] = format_dt_obj(dt_d, include_time=False)
 
-        # 3. tRPC API からチケット販売期間と公演日を取得
-        event_slug = event_url.split("/event/")[-1].split("/")[0].split("?")[0]
-        api_data = fetch_api_details(event_slug, headers)
+        # 3. HTMLソース全体からの直接テキスト抽出（最強力）
+        html_tickets = extract_sales_periods_from_html(html)
+        if html_tickets:
+            periods, e_date = process_extracted_periods(html_tickets, [])
+            if periods:
+                extracted["sales_periods"] = periods
 
-        if api_data:
-            if api_data["sales_periods"]:
-                extracted["sales_periods"] = api_data["sales_periods"]
-            if api_data["event_date"]:
-                extracted["event_date"] = api_data["event_date"]
+        # 4. JSONタグからの解析
+        if not extracted["sales_periods"]:
+            for script in soup.find_all("script"):
+                if script.string and ("salesStart" in script.string or "salesStartAt" in script.string or "ticket" in script.string):
+                    try:
+                        s_json = json.loads(script.string)
+                        tickets, event_dates = search_json_recursive(s_json)
+                        periods, e_date = process_extracted_periods(tickets, event_dates)
+                        if periods:
+                            extracted["sales_periods"] = periods
+                            if e_date and extracted["event_date"] == "情報なし":
+                                extracted["event_date"] = e_date
+                            break
+                    except Exception:
+                        pass
+
+        # 5. tRPC API からのバックアップ取得
+        if not extracted["sales_periods"]:
+            event_slug = event_url.split("/event/")[-1].split("/")[0].split("?")[0]
+            api_data = fetch_api_details(event_slug, headers)
+            if api_data:
+                if api_data["sales_periods"]:
+                    extracted["sales_periods"] = api_data["sales_periods"]
+                if api_data["event_date"] and extracted["event_date"] == "情報なし":
+                    extracted["event_date"] = api_data["event_date"]
 
         # フォールバック表記
         if not extracted["sales_periods"]:
@@ -294,6 +337,7 @@ def fetch_event_details(event_url, headers):
 def fetch_events():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     }
     response = requests.get(TARGET_URL, headers=headers)
@@ -387,3 +431,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
