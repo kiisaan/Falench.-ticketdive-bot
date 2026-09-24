@@ -118,7 +118,6 @@ def extract_sales_periods_from_html(html_text):
             dt_s = parse_datetime_obj(s_start)
             dt_e = parse_datetime_obj(s_end)
             if dt_s and dt_e:
-                # 明らかに公演日（数日感の幅）ではなく販売枠らしい範囲（年が妥当か等）を検証
                 item = {"name": "", "start": dt_s, "end": dt_e}
                 if item not in tickets:
                     tickets.append(item)
@@ -220,7 +219,7 @@ def process_extracted_periods(tickets, event_dates):
 
 
 def fetch_api_details(event_slug, headers):
-    """tRPC APIから直接イベント情報を取得（各種エンドポイント検証）"""
+    """tRPC APIから直接イベント情報を取得（構文エラー回避修正版）"""
     api_headers = headers.copy()
     api_headers.update(
         {
@@ -230,10 +229,15 @@ def fetch_api_details(event_slug, headers):
         }
     )
 
+    # f-string 内でのエスケープ文字エラーを避けるため事前に文字を作成
+    param_single = json.dumps({"json": {"slug": event_slug}})
+    param_batch = json.dumps({"0": {"json": {"slug": event_slug}}})
+    param_id = json.dumps({"json": {"id": event_slug}})
+
     endpoints = [
-        f"https://ticketdive.com/api/trpc/event.getBySlug?input={urllib.parse.quote(f'{{\"json\":{{\"slug\":\"{event_slug}\"}}}}')}",
-        f"https://ticketdive.com/api/trpc/event.getBySlug?batch=1&input={urllib.parse.quote(f'{{\"0\":{{\"json\":{{\"slug\":\"{event_slug}\"}}}}}}')}",
-        f"https://ticketdive.com/api/trpc/event.getById?input={urllib.parse.quote(f'{{\"json\":{{\"id\":\"{event_slug}\"}}}}')}",
+        f"https://ticketdive.com/api/trpc/event.getBySlug?input={urllib.parse.quote(param_single)}",
+        f"https://ticketdive.com/api/trpc/event.getBySlug?batch=1&input={urllib.parse.quote(param_batch)}",
+        f"https://ticketdive.com/api/trpc/event.getById?input={urllib.parse.quote(param_id)}",
     ]
 
     for api_url in endpoints:
@@ -289,7 +293,7 @@ def fetch_event_details(event_url, headers):
                 if dt_d:
                     extracted["event_date"] = format_dt_obj(dt_d, include_time=False)
 
-        # 3. HTMLソース全体からの直接テキスト抽出（最強力）
+        # 3. HTMLソース全体からの直接テキスト抽出
         html_tickets = extract_sales_periods_from_html(html)
         if html_tickets:
             periods, e_date = process_extracted_periods(html_tickets, [])
@@ -431,4 +435,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
