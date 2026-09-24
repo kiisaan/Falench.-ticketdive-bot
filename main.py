@@ -49,7 +49,7 @@ def clean_title(raw_title):
 
 
 def format_dt(dt_input):
-    """各種日付・時刻表現を「MM/DD（曜日）HH:MM」または「MM/DD（曜日）」等に統一整形"""
+    """日付・時刻表現を「MM/DD（曜日）HH:MM」または「MM/DD（曜日）」等に整形"""
     if not dt_input:
         return None
 
@@ -83,13 +83,12 @@ def format_dt(dt_input):
 
 
 def fetch_api_details(event_slug, headers):
-    """TicketDiveのtRPC APIからチケット詳細データを直接取得"""
+    """TicketDiveのtRPC APIからチケット詳細（販売期間・日付）を直接取得"""
     api_url = f'https://ticketdive.com/api/trpc/event.getBySlug?input={{"json":{{"slug":"{event_slug}"}}}}'
     try:
         res = requests.get(api_url, headers=headers, timeout=8)
         if res.status_code == 200:
             data = res.json()
-            # tRPCレスポンス構造の解析
             result_data = (
                 data.get("result", {})
                 .get("data", {})
@@ -115,14 +114,10 @@ def fetch_api_details(event_slug, headers):
                     if period not in sales_periods:
                         sales_periods.append(period)
 
-            open_at = result_data.get("openAt") or result_data.get("open_at")
-            start_at = result_data.get("startAt") or result_data.get("start_at")
             event_date = result_data.get("eventDate") or result_data.get("date")
 
             return {
                 "sales_periods": sales_periods,
-                "open_at": format_dt(open_at) if open_at else None,
-                "start_at": format_dt(start_at) if start_at else None,
                 "event_date": format_dt(event_date) if event_date else None,
             }
     except Exception as e:
@@ -144,8 +139,6 @@ def fetch_event_details(event_url, headers):
         extracted = {
             "title": "イベント名称未設定",
             "event_date": "情報なし",
-            "open_time": "情報なし",
-            "start_time": "情報なし",
             "sales_periods": [],
         }
 
@@ -156,48 +149,25 @@ def fetch_event_details(event_url, headers):
             if cand_og:
                 extracted["title"] = cand_og
 
-        # 2. メタタグ（og:description / description）のテキスト解析
-        meta_desc = ""
+        # 2. メタタグ（og:description）から公演日を解析
         desc_tag = soup.find("meta", property="og:description") or soup.find(
             "meta", attrs={"name": "description"}
         )
         if desc_tag and desc_tag.get("content"):
             meta_desc = desc_tag["content"]
+            m_date = re.search(
+                r"【日付】\s*(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})", meta_desc
+            )
+            if m_date:
+                extracted["event_date"] = format_dt(m_date.group(1))
 
-        # 公演日の抽出 (例: 【日付】2026/09/27)
-        m_date = re.search(
-            r"【日付】\s*(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})", meta_desc
-        )
-        if m_date:
-            extracted["event_date"] = format_dt(m_date.group(1))
-
-        # 開場・開演時刻の抽出 (例: 【開場/開演】10:30 / 10:45)
-        m_times = re.search(
-            r"【開場/開演】\s*(\d{1,2}:\d{2})\s*/\s*(\d{1,2}:\d{2})", meta_desc
-        )
-        if m_times:
-            extracted["open_time"] = m_times.group(1).strip()
-            extracted["start_time"] = m_times.group(2).strip()
-
-        # 3. 内部API（tRPC）からの高精度補完
+        # 3. 内部API（tRPC）からのデータ補完
         event_slug = event_url.split("/event/")[-1].split("/")[0].split("?")[0]
         api_data = fetch_api_details(event_slug, headers)
 
         if api_data:
             if api_data["sales_periods"]:
                 extracted["sales_periods"] = api_data["sales_periods"]
-            if extracted["open_time"] == "情報なし" and api_data["open_at"]:
-                if " " in api_data["open_at"]:
-                    extracted["open_time"] = api_data["open_at"].split(" ")[-1]
-                else:
-                    extracted["open_time"] = api_data["open_at"]
-
-            if extracted["start_time"] == "情報なし" and api_data["start_at"]:
-                if " " in api_data["start_at"]:
-                    extracted["start_time"] = api_data["start_at"].split(" ")[-1]
-                else:
-                    extracted["start_time"] = api_data["start_at"]
-
             if (
                 extracted["event_date"] == "情報なし"
                 and api_data["event_date"]
@@ -206,7 +176,6 @@ def fetch_event_details(event_url, headers):
 
         # 4. 販売期間の最終フォールバック解析
         if not extracted["sales_periods"]:
-            # HTML本文内のISO/文字列表現を検索
             sales_m = re.findall(
                 r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
                 html,
@@ -301,8 +270,6 @@ def main():
                     f"イベント名：{ev['title']}\n"
                     f"販売期間：{sales}\n"
                     f"公演日：{ev['event_date']}\n"
-                    f"開場時刻：{ev['open_time']}\n"
-                    f"開演時刻：{ev['start_time']}\n"
                     f"URL：{ev['url']}"
                 )
                 msg_blocks.append(block_text)
