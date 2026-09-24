@@ -2,8 +2,14 @@ name: TicketDive Tracker
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 1時間ごとに自動実行
-  workflow_dispatch:      # 手動テスト実行ボタンを表示
+    - cron: '0 * * * *'  # 1時間ごとの自動実行（通常時は重複通知しない）
+  workflow_dispatch:      # 手動実行用
+    inputs:
+      reset_history:
+        description: '過去の通知履歴をリセットして全件再通知する'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-bot:
@@ -21,6 +27,12 @@ jobs:
       - name: 必要なライブラリのインストール
         run: |
           pip install requests beautifulsoup4
+
+      - name: 履歴リセット（手動実行でチェックを入れた場合）
+        if: github.event.inputs.reset_history == 'true'
+        run: |
+          rm -f seen_events.json
+          echo "通知履歴をリセットしました。"
 
       - name: スクリプト実行
         env:
