@@ -51,8 +51,8 @@ def clean_title(raw_title):
     return title
 
 
-def format_dt(dt_input):
-    """日付・時刻表現を「MM/DD（曜日）HH:MM」等に整形"""
+def parse_datetime_obj(dt_input):
+    """日時文字列や数値から datetime(JST) オブジェクトを取得"""
     if not dt_input:
         return None
 
@@ -61,71 +61,30 @@ def format_dt(dt_input):
     # 13桁のミリ秒タイムスタンプ
     if dt_str.isdigit() and len(dt_str) == 13:
         try:
-            dt = datetime.fromtimestamp(int(dt_str) / 1000, tz=JST)
-            weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-            return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
+            return datetime.fromtimestamp(int(dt_str) / 1000, tz=JST)
         except Exception:
             pass
 
     # ISO 8601
     try:
         clean_iso = dt_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(clean_iso).astimezone(JST)
-        weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-        return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
+        return datetime.fromisoformat(clean_iso).astimezone(JST)
     except Exception:
         pass
 
-    # YYYY/MM/DD または YYYY-MM-DD
-    m_date = re.search(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})", dt_str)
-    if m_date:
-        try:
-            year, month, day = (
-                int(m_date.group(1)),
-                int(m_date.group(2)),
-                int(m_date.group(3)),
-            )
-            dt = datetime(year, month, day)
-            weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-            return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）"
-        except Exception:
-            pass
-
-    return dt_str
+    return None
 
 
-def parse_raw_html_for_dates(html):
-    """HTML全文字列からISO日時ペア・タイムスタンプペアを強力抽出"""
-    periods = []
-
-    # パターン1: ISO日時のペア（"2026-08-28T13:00:00.000Z" 等）
-    iso_pattern = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+\d{2}:\d{2})?"
-    found_isos = re.findall(iso_pattern, html)
-
-    if len(found_isos) >= 2:
-        # ペアを作成して整形
-        for i in range(0, len(found_isos) - 1, 2):
-            s_fmt = format_dt(found_isos[i])
-            e_fmt = format_dt(found_isos[i + 1])
-            if s_fmt and e_fmt:
-                p = f"{s_fmt} ～ {e_fmt}"
-                if p not in periods:
-                    periods.append(p)
-
-    # パターン2: 日本語表記（例: 08/28(金)22:00 ～ 09/27(日)10:30）
-    sales_m = re.findall(
-        r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
-        html,
-    )
-    for m in sales_m:
-        if m not in periods:
-            periods.append(m)
-
-    return periods
+def format_dt_obj(dt_obj):
+    """datetime オブジェクトを 「MM/DD（曜日）HH:MM」 に整形"""
+    if not dt_obj:
+        return ""
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    return f"{dt_obj.month:02d}/{dt_obj.day:02d}（{weekdays[dt_obj.weekday()]}）{dt_obj.hour:02d}:{dt_obj.minute:02d}"
 
 
 def fetch_api_details(event_slug, headers):
-    """tRPC APIから正確なチケット情報を直接取得"""
+    """tRPC APIからチケット情報を取得し、最も適切な（最新/有効な）販売期間のみを抽出"""
     input_param = urllib.parse.quote(f'{{"json":{{"slug":"{event_slug}"}}}}')
     api_url = f"https://ticketdive.com/api/trpc/event.getBySlug?input={input_param}"
 
@@ -140,46 +99,77 @@ def fetch_api_details(event_slug, headers):
     try:
         res = requests.get(api_url, headers=api_headers, timeout=8)
         if res.status_code == 200:
-            periods = parse_raw_html_for_dates(res.text)
+            data = res.json()
+            result_data = (
+                data.get("result", {})
+                .get("data", {})
+                .get("json", {})
+            )
+            tickets = result_data.get("ticketTypes", []) or result_data.get(
+                "tickets", []
+            )
 
-            # JSONデータからチケット種別ごとの抽出
-            try:
-                data = res.json()
-                result_data = (
-                    data.get("result", {})
-                    .get("data", {})
-                    .get("json", {})
+            now = datetime.now(JST)
+            valid_periods = []
+            upcoming_periods = []
+            all_periods = []
+
+            for t in tickets:
+                t_name = t.get("name", "")
+                s_start_raw = (
+                    t.get("salesStartAt")
+                    or t.get("sales_start_at")
+                    or t.get("startAt")
                 )
-                tickets = result_data.get("ticketTypes", []) or result_data.get(
-                    "tickets", []
+                s_end_raw = (
+                    t.get("salesEndAt")
+                    or t.get("sales_end_at")
+                    or t.get("endAt")
                 )
 
-                for t in tickets:
-                    t_name = t.get("name", "")
-                    s_start = (
-                        t.get("salesStartAt")
-                        or t.get("sales_start_at")
-                        or t.get("startAt")
-                    )
-                    s_end = (
-                        t.get("salesEndAt")
-                        or t.get("sales_end_at")
-                        or t.get("endAt")
-                    )
+                dt_start = parse_datetime_obj(s_start_raw)
+                dt_end = parse_datetime_obj(s_end_raw)
 
-                    if s_start and s_end:
-                        fmt_s = format_dt(s_start)
-                        fmt_e = format_dt(s_end)
-                        prefix = f"【{t_name}】" if t_name else ""
-                        p = f"{prefix}{fmt_s} ～ {fmt_e}"
-                        if p not in periods:
-                            periods.append(p)
-            except Exception:
-                pass
+                if dt_start and dt_end:
+                    fmt_s = format_dt_obj(dt_start)
+                    fmt_e = format_dt_obj(dt_end)
+                    prefix = f"【{t_name}】" if t_name else ""
+                    period_str = f"{prefix}{fmt_s} ～ {fmt_e}"
 
-            return periods
+                    item = {
+                        "str": period_str,
+                        "start": dt_start,
+                        "end": dt_end,
+                    }
+
+                    if period_str not in [p["str"] for p in all_periods]:
+                        all_periods.append(item)
+
+                    # 現在販売中
+                    if dt_start <= now <= dt_end:
+                        if period_str not in [p["str"] for p in valid_periods]:
+                            valid_periods.append(item)
+                    # 将来の販売予定
+                    elif now < dt_start:
+                        if period_str not in [p["str"] for p in upcoming_periods]:
+                            upcoming_periods.append(item)
+
+            # 1. 現在販売中の枠があればそれを最優先（最大2件まで）
+            if valid_periods:
+                return [p["str"] for p in valid_periods[:2]]
+
+            # 2. 次に販売予定の枠があればそれを優先（直近の1件）
+            if upcoming_periods:
+                upcoming_periods.sort(key=lambda x: x["start"])
+                return [upcoming_periods[0]["str"]]
+
+            # 3. すべて終了済みの場合は最新のものを1件のみ表示
+            if all_periods:
+                all_periods.sort(key=lambda x: x["end"], reverse=True)
+                return [all_periods[0]["str"]]
+
     except Exception as e:
-        print(f"API取得失敗 ({event_slug}): {e}")
+        print(f"API取得エラー ({event_slug}): {e}")
 
     return []
 
@@ -217,25 +207,20 @@ def fetch_event_details(event_url, headers):
                 r"【日付】\s*(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})", meta_desc
             )
             if m_date:
-                extracted["event_date"] = format_dt(m_date.group(1))
+                dt_d = parse_datetime_obj(m_date.group(1))
+                if dt_d:
+                    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+                    extracted["event_date"] = (
+                        f"{dt_d.month:02d}/{dt_d.day:02d}（{weekdays[dt_d.weekday()]}）"
+                    )
 
-        # 3. イベントslugの抽出とAPI直接リクエスト
+        # 3. APIから最適な販売期間のみを取得
         event_slug = event_url.split("/event/")[-1].split("/")[0].split("?")[0]
         api_periods = fetch_api_details(event_slug, headers)
+
         if api_periods:
-            extracted["sales_periods"].extend(api_periods)
-
-        # 4. 生HTMLからの正規表現全探索（フォールバック）
-        if not extracted["sales_periods"]:
-            html_periods = parse_raw_html_for_dates(html)
-            if html_periods:
-                extracted["sales_periods"].extend(html_periods)
-
-        # 重複削除
-        extracted["sales_periods"] = list(dict.fromkeys(extracted["sales_periods"]))
-
-        # どうしても取得できない場合
-        if not extracted["sales_periods"]:
+            extracted["sales_periods"] = api_periods
+        else:
             extracted["sales_periods"] = ["公式ページをご確認ください"]
 
         extracted["url"] = event_url
@@ -318,14 +303,14 @@ def main():
 
         msg_blocks = []
         for ev in new_events:
-            for sales in ev["sales_periods"]:
-                block_text = (
-                    f"イベント名：{ev['title']}\n"
-                    f"販売期間：{sales}\n"
-                    f"公演日：{ev['event_date']}\n"
-                    f"URL：{ev['url']}"
-                )
-                msg_blocks.append(block_text)
+            sales_text = "\n".join(ev["sales_periods"])
+            block_text = (
+                f"イベント名：{ev['title']}\n"
+                f"販売期間：{sales_text}\n"
+                f"公演日：{ev['event_date']}\n"
+                f"URL：{ev['url']}"
+            )
+            msg_blocks.append(block_text)
 
         chunk_size = 2
         for i in range(0, len(msg_blocks), chunk_size):
