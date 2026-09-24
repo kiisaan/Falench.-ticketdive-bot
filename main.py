@@ -144,10 +144,16 @@ def fetch_events():
 
 def load_seen_events():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:  # ファイルが空の場合
+                    return set()
+                return set(json.loads(content))
+        except json.JSONDecodeError:
+            print("seen_events.json の読み込みに失敗したため、空のリストで初期化します。")
+            return set()
     return set()
-
 
 def save_seen_events(seen_set):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
