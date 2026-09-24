@@ -13,43 +13,40 @@ LINE_GROUP_ID = os.getenv("LINE_GROUP_ID")
 
 
 def clean_title(raw_title):
-    """イベント名から出演者情報や余計な改行を除去する"""
+    """イベント名から過度な文字削りを防ぎ、明確な出演者ラベル以降のみカットする"""
     if not raw_title:
         return "イベント名称未設定"
 
-    # 改行を空白に置換
+    # 改行や連続スペースの整理
     title = re.sub(r"[\r\n]+", " ", raw_title).strip()
 
-    # 出演者・対バン等の区切り文字列以降を削除
+    # 「/」での分割を廃止し、明確な出演者指定ラベルのみで分割
     title = re.split(
-        r"(?:/|／|【出演】|出演[：:]|@|［出演］|ACT[：:]|w/|W/)", title
+        r"(?:【出演】|出演[：:]|［出演］|ACT[：:]|【CAST】|CAST[：:])", title
     )[0].strip()
 
-    # 連続する半角スペースを短記
-    title = re.sub(r"\s+", " ", title)
+    # 末尾に残った不要な記号を削除
+    title = re.sub(r"[\s\-/／]+$", "", title)
 
     return title if title else "イベント名称未設定"
 
 
 def parse_datetime_str(dt_str):
-    """09/25（金）20:00 形式の文字列を datetime オブジェクトに変換（年は現在年補完）"""
+    """09/25（金）20:00 形式の文字列を datetime に変換（年は現在年）"""
     try:
-        # 曜日表記（（金）や (金)）を取り除く
         clean_str = re.sub(r"[\(（].+?[\)）]", "", dt_str).strip()
-        # 月/日 時:分
         now = datetime.now()
         dt = datetime.strptime(clean_str, "%m/%d %H:%M")
-        # 年を現在年に設定（月が12から1に跨ぐケース等は考慮して調整可能）
         return dt.replace(year=now.year)
     except Exception:
         return None
 
 
 def is_currently_open(sales_str):
-    """販売期間内に『今日』が含まれているか判定する"""
+    """販売期間内に『現在日時』が含まれているか判定"""
     now = datetime.now()
 
-    # 開始日時 〜 終了日時 のパターンを抽出
+    # 開始日時 〜 終了日時
     match = re.search(
         r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})\s*～\s*(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
         sales_str,
@@ -60,7 +57,7 @@ def is_currently_open(sales_str):
         if start_dt and end_dt:
             return start_dt <= now <= end_dt
 
-    # 開始日時 〜 のみのパターン
+    # 開始日時 〜
     match_start = re.search(
         r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})\s*～", sales_str
     )
@@ -73,78 +70,61 @@ def is_currently_open(sales_str):
 
 
 def parse_sales_info(soup, page_text):
-    """販売期間を抽出し、取得日が期間内の場合のみ（申込受付中）を付与"""
+    """TicketDiveの構造に合わせた販売期間取得処理"""
     sales_list = []
 
-    # ページ内の「受付期間」「販売期間」が含まれるブロックから取得
-    ticket_blocks = soup.find_all(text=re.compile(r"(受付期間|販売期間|申込期間)"))
+    # 1. ページ内の全テキストから「日時 〜 日時」パターンを広く抽出
+    matches = re.findall(
+        r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*(?:\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})?)",
+        page_text,
+    )
 
-    for block in ticket_blocks:
-        parent = block.find_parent(["tr", "div", "li", "p"])
-        if parent:
-            text = parent.get_text(separator=" ", strip=True)
-            match = re.search(
-                r"(\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]\s*\d{1,2}:\d{2}\s*～(?:\s*\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]\s*\d{1,2}:\d{2})?)",
-                text,
-            )
-            if match:
-                s_info = match.group(1).strip()
-                # 日付判定：取得日が期間内にある場合のみ（申込受付中）を付加
-                if is_currently_open(s_info):
-                    s_info += "（申込受付中）"
-                sales_list.append(s_info)
-
-    # 見つからない場合のフォールバック（全体からの正規表現抽出）
-    if not sales_list:
-        matches = re.findall(
-            r"(\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]\s*\d{1,2}:\d{2}\s*～(?:\s*\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]\s*\d{1,2}:\d{2})?)",
-            page_text,
-        )
-        for m in matches:
-            info = m.strip()
-            if is_currently_open(info):
+    for m in matches:
+        info = m.strip()
+        # 公演日などの開場・開演時刻と誤認しないよう「～」を含むものに限定
+        if "～" in info:
+            if is_currently_open(info) and "（申込受付中）" not in info:
                 info += "（申込受付中）"
             sales_list.append(info)
 
-    # 重複削除
+    # 重複の削除
     unique_sales = []
     for s in sales_list:
         if s not in unique_sales:
             unique_sales.append(s)
 
-    return unique_sales if unique_sales else ["日時情報なし"]
+    return unique_sales if unique_sales else ["詳細ページをご確認ください"]
 
 
 def fetch_event_details(event_url, headers):
-    """個別イベントページから詳細情報を抽出"""
+    """個別イベントページから正確に各項目をスクレイピング"""
     try:
         res = requests.get(event_url, headers=headers, timeout=10)
         if res.status_code != 200:
             return None
 
         soup = BeautifulSoup(res.text, "html.parser")
-        page_text = soup.get_text()
+        page_text = soup.get_text(separator=" ", strip=True)
 
-        # 1. イベント名の取得・クレンジング（出演者をカット）
+        # 1. イベント名の取得（h1 や meta から安全に抽出）
         raw_title = ""
-        og_title = soup.find("meta", property="og:title")
-        if og_title and og_title.get("content"):
-            raw_title = (
-                og_title["content"].split("｜")[0].split("-")[0].strip()
-            )
+        h1_el = soup.find("h1")
+        if h1_el:
+            raw_title = h1_el.get_text(strip=True)
 
         if not raw_title:
-            h_el = soup.find("h1") or soup.find("h2")
-            if h_el:
-                raw_title = h_el.get_text()
+            og_title = soup.find("meta", property="og:title")
+            if og_title and og_title.get("content"):
+                raw_title = og_title["content"].split("｜")[0].split(" - ")[0].strip()
 
         title = clean_title(raw_title)
 
-        # 2. 公演日
-        date_str = "情報なし"
+        # 2. 公演日（例: 10/10（土） または 2026/10/10）
+        date_str = "詳細ページをご確認ください"
         date_match = re.search(
             r"(?:日程|開催日|公演日|DATE)[\s:：]*(\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]|\d{4}/\d{1,2}/\d{1,2})",
             page_text,
+            re.IGNORECASE,
         )
         if date_match:
             date_str = date_match.group(1).strip()
@@ -171,7 +151,7 @@ def fetch_event_details(event_url, headers):
         if start_match:
             start_time = start_match.group(1).strip()
 
-        # 4. 販売期間（判定付き）
+        # 4. 販売期間
         sales_periods = parse_sales_info(soup, page_text)
 
         return {
