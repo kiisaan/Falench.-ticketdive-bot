@@ -72,19 +72,83 @@ def parse_datetime_obj(dt_input):
     except Exception:
         pass
 
+    # YYYY/MM/DD や YYYY-MM-DD
+    m_date = re.search(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})", dt_str)
+    if m_date:
+        try:
+            year, month, day = (
+                int(m_date.group(1)),
+                int(m_date.group(2)),
+                int(m_date.group(3)),
+            )
+            return datetime(year, month, day, tzinfo=JST)
+        except Exception:
+            pass
+
     return None
 
 
-def format_dt_obj(dt_obj):
-    """datetime オブジェクトを 「MM/DD（曜日）HH:MM」 に整形"""
+def format_dt_obj(dt_obj, include_time=True):
+    """datetime オブジェクトを整形"""
     if not dt_obj:
         return ""
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-    return f"{dt_obj.month:02d}/{dt_obj.day:02d}（{weekdays[dt_obj.weekday()]}）{dt_obj.hour:02d}:{dt_obj.minute:02d}"
+    if include_time:
+        return f"{dt_obj.month:02d}/{dt_obj.day:02d}（{weekdays[dt_obj.weekday()]}）{dt_obj.hour:02d}:{dt_obj.minute:02d}"
+    return f"{dt_obj.month:02d}/{dt_obj.day:02d}（{weekdays[dt_obj.weekday()]}）"
+
+
+def search_json_recursive(data):
+    """JSON全体を再帰的に走査してチケット種別一覧と公演日を取得"""
+    tickets = []
+    event_dates = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            # 公演日キーの検出
+            for k in ["eventDate", "event_date", "date", "eventStartAt"]:
+                if k in obj and obj[k]:
+                    dt = parse_datetime_obj(obj[k])
+                    if dt:
+                        event_dates.append(dt)
+
+            # チケット販売枠キーの検出
+            s_start = (
+                obj.get("salesStartAt")
+                or obj.get("sales_start_at")
+                or obj.get("startAt")
+                or obj.get("salesStart")
+            )
+            s_end = (
+                obj.get("salesEndAt")
+                or obj.get("sales_end_at")
+                or obj.get("endAt")
+                or obj.get("salesEnd")
+            )
+            t_name = obj.get("name") or obj.get("title") or ""
+
+            if s_start and s_end:
+                tickets.append(
+                    {
+                        "name": str(t_name),
+                        "start": parse_datetime_obj(s_start),
+                        "end": parse_datetime_obj(s_end),
+                    }
+                )
+
+            for v in obj.values():
+                walk(v)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return tickets, event_dates
 
 
 def fetch_api_details(event_slug, headers):
-    """tRPC APIからチケット情報を取得し、最も適切な（最新/有効な）販売期間のみを抽出"""
+    """tRPC API経由でチケット情報と公演日時を取得"""
     input_param = urllib.parse.quote(f'{{"json":{{"slug":"{event_slug}"}}}}')
     api_url = f"https://ticketdive.com/api/trpc/event.getBySlug?input={input_param}"
 
@@ -100,14 +164,7 @@ def fetch_api_details(event_slug, headers):
         res = requests.get(api_url, headers=api_headers, timeout=8)
         if res.status_code == 200:
             data = res.json()
-            result_data = (
-                data.get("result", {})
-                .get("data", {})
-                .get("json", {})
-            )
-            tickets = result_data.get("ticketTypes", []) or result_data.get(
-                "tickets", []
-            )
+            tickets, event_dates = search_json_recursive(data)
 
             now = datetime.now(JST)
             valid_periods = []
@@ -115,25 +172,13 @@ def fetch_api_details(event_slug, headers):
             all_periods = []
 
             for t in tickets:
-                t_name = t.get("name", "")
-                s_start_raw = (
-                    t.get("salesStartAt")
-                    or t.get("sales_start_at")
-                    or t.get("startAt")
-                )
-                s_end_raw = (
-                    t.get("salesEndAt")
-                    or t.get("sales_end_at")
-                    or t.get("endAt")
-                )
-
-                dt_start = parse_datetime_obj(s_start_raw)
-                dt_end = parse_datetime_obj(s_end_raw)
+                dt_start = t["start"]
+                dt_end = t["end"]
 
                 if dt_start and dt_end:
-                    fmt_s = format_dt_obj(dt_start)
-                    fmt_e = format_dt_obj(dt_end)
-                    prefix = f"【{t_name}】" if t_name else ""
+                    fmt_s = format_dt_obj(dt_start, include_time=True)
+                    fmt_e = format_dt_obj(dt_end, include_time=True)
+                    prefix = f"【{t['name']}】" if t["name"] and len(t["name"]) < 25 else ""
                     period_str = f"{prefix}{fmt_s} ～ {fmt_e}"
 
                     item = {
@@ -145,33 +190,35 @@ def fetch_api_details(event_slug, headers):
                     if period_str not in [p["str"] for p in all_periods]:
                         all_periods.append(item)
 
-                    # 現在販売中
                     if dt_start <= now <= dt_end:
                         if period_str not in [p["str"] for p in valid_periods]:
                             valid_periods.append(item)
-                    # 将来の販売予定
                     elif now < dt_start:
                         if period_str not in [p["str"] for p in upcoming_periods]:
                             upcoming_periods.append(item)
 
-            # 1. 現在販売中の枠があればそれを最優先（最大2件まで）
+            selected_periods = []
             if valid_periods:
-                return [p["str"] for p in valid_periods[:2]]
-
-            # 2. 次に販売予定の枠があればそれを優先（直近の1件）
-            if upcoming_periods:
+                selected_periods = [p["str"] for p in valid_periods[:2]]
+            elif upcoming_periods:
                 upcoming_periods.sort(key=lambda x: x["start"])
-                return [upcoming_periods[0]["str"]]
-
-            # 3. すべて終了済みの場合は最新のものを1件のみ表示
-            if all_periods:
+                selected_periods = [upcoming_periods[0]["str"]]
+            elif all_periods:
                 all_periods.sort(key=lambda x: x["end"], reverse=True)
-                return [all_periods[0]["str"]]
+                selected_periods = [all_periods[0]["str"]]
 
+            fmt_event_date = None
+            if event_dates:
+                fmt_event_date = format_dt_obj(event_dates[0], include_time=False)
+
+            return {
+                "sales_periods": selected_periods,
+                "event_date": fmt_event_date,
+            }
     except Exception as e:
         print(f"API取得エラー ({event_slug}): {e}")
 
-    return []
+    return None
 
 
 def fetch_event_details(event_url, headers):
@@ -197,30 +244,66 @@ def fetch_event_details(event_url, headers):
             if cand_og:
                 extracted["title"] = cand_og
 
-        # 2. メタタグ（og:description）から公演日を解析
+        # 2. メタタグ（og:description / description）から公演日を予備解析
         desc_tag = soup.find("meta", property="og:description") or soup.find(
             "meta", attrs={"name": "description"}
         )
         if desc_tag and desc_tag.get("content"):
             meta_desc = desc_tag["content"]
             m_date = re.search(
-                r"【日付】\s*(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})", meta_desc
+                r"【?日付】?\s*(\d{4}[/\-]\d{1,2}[/\-]\d{1,2}|\d{1,2}[/\-]\d{1,2})",
+                meta_desc,
             )
             if m_date:
                 dt_d = parse_datetime_obj(m_date.group(1))
                 if dt_d:
-                    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-                    extracted["event_date"] = (
-                        f"{dt_d.month:02d}/{dt_d.day:02d}（{weekdays[dt_d.weekday()]}）"
+                    extracted["event_date"] = format_dt_obj(
+                        dt_d, include_time=False
                     )
 
-        # 3. APIから最適な販売期間のみを取得
+        # 3. API経由でのデータ取得
         event_slug = event_url.split("/event/")[-1].split("/")[0].split("?")[0]
-        api_periods = fetch_api_details(event_slug, headers)
+        api_data = fetch_api_details(event_slug, headers)
 
-        if api_periods:
-            extracted["sales_periods"] = api_periods
-        else:
+        if api_data:
+            if api_data["sales_periods"]:
+                extracted["sales_periods"] = api_data["sales_periods"]
+            if api_data["event_date"]:
+                extracted["event_date"] = api_data["event_date"]
+
+        # 4. Next.js スクリプトタグ（__NEXT_DATA__）からの補完解析
+        if (
+            not extracted["sales_periods"]
+            or extracted["event_date"] == "情報なし"
+        ):
+            next_data_script = soup.find("script", id="__NEXT_DATA__")
+            if next_data_script and next_data_script.string:
+                try:
+                    next_json = json.loads(next_data_script.string)
+                    tickets, event_dates = search_json_recursive(next_json)
+
+                    if not extracted["sales_periods"] and tickets:
+                        for t in tickets:
+                            if t["start"] and t["end"]:
+                                fmt_s = format_dt_obj(t["start"], True)
+                                fmt_e = format_dt_obj(t["end"], True)
+                                extracted["sales_periods"].append(
+                                    f"{fmt_s} ～ {fmt_e}"
+                                )
+                                break
+
+                    if (
+                        extracted["event_date"] == "情報なし"
+                        and event_dates
+                    ):
+                        extracted["event_date"] = format_dt_obj(
+                            event_dates[0], False
+                        )
+                except Exception:
+                    pass
+
+        # フォールバック処理
+        if not extracted["sales_periods"]:
             extracted["sales_periods"] = ["公式ページをご確認ください"]
 
         extracted["url"] = event_url
