@@ -13,63 +13,63 @@ LINE_GROUP_ID = os.getenv("LINE_GROUP_ID")
 
 
 def clean_title(raw_title):
-    """タイトルから不要な接尾辞を除去"""
+    """タイトルから不要な文言や共通画面要素を除去"""
     if not raw_title:
         return "イベント名称未設定"
 
     title = re.sub(r"[\r\n]+", " ", str(raw_title)).strip()
-    title = re.sub(
-        r"[\s:：\-–|]*?(?:販売情報|チケット情報|TicketDive).*$",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    ).strip()
+
+    # 「チケットの分配」などのUI共通見出しやデフォルト文字列を徹底削除
+    ng_words = [
+        "チケットの分配",
+        "チケット分配",
+        "販売情報",
+        "チケット情報",
+        "TicketDive",
+        "ログイン",
+        "マイページ",
+        "新規会員登録",
+    ]
+    for ng in ng_words:
+        title = re.sub(re.escape(ng), "", title, flags=re.IGNORECASE).strip()
+
+    # 出演者表記以降をカット
     title = re.split(
         r"(?:【出演】|出演[：:]|［出演］|ACT[：:]|【CAST】|CAST[：:])", title
     )[0].strip()
-    title = re.sub(r"[\s\-/／:：]+$", "", title).strip()
+    title = re.sub(r"^[\s:：\-–|]+|[\s\-/／:：]+$", "", title).strip()
 
     return title if title else "イベント名称未設定"
 
 
 def format_dt(dt_input):
-    """様々な日付フォーマット（ISO8601、Timestamp等）を「MM/DD（週）HH:MM」形式に統一変換"""
+    """ISO8601表記やUnixタイムスタンプを「MM/DD（週）HH:MM」形式に変換"""
     if not dt_input:
         return None
 
-    dt_str = str(dt_input).strip()
-    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-
-    # 1. ISO 8601 (例: 2026-09-25T18:00:00.000Z)
     try:
+        # 数値（ミリ秒タイムスタンプ）の場合
+        if isinstance(dt_input, (int, float)):
+            dt = datetime.fromtimestamp(dt_input / 1000.0)
+            weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+            return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
+
+        dt_str = str(dt_input).strip()
+        weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+
+        # ISO 8601
         clean_iso = dt_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(clean_iso)
         return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
     except Exception:
         pass
 
-    # 2. YYYY-MM-DD HH:MM:SS または YYYY/MM/DD HH:MM
-    match = re.search(
-        r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:\s+|T)(\d{1,2}):(\d{2})", dt_str
-    )
-    if match:
-        y, m, d, hh, mm = map(int, match.groups())
-        dt = datetime(y, m, d, hh, mm)
-        return f"{m:02d}/{d:02d}（{weekdays[dt.weekday()]}）{hh:02d}:{mm:02d}"
-
-    # 3. YYYY-MM-DD または YYYY/MM/DD（時刻なし）
-    match_date = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", dt_str)
-    if match_date:
-        y, m, d = map(int, match_date.groups())
-        dt = datetime(y, m, d)
-        return f"{m:02d}/{d:02d}（{weekdays[dt.weekday()]}）"
-
-    return dt_str
+    return str(dt_input)
 
 
-def deep_search_json(data):
-    """Next.js / tRPCの動的状態オブジェクトからキー・値を再帰的に全探索"""
-    extracted = {
+def extract_from_trpc(data):
+    """TicketDive固有の tRPC データ構造から正確にイベント情報を抽出"""
+    result = {
         "title": None,
         "event_date": None,
         "open_time": None,
@@ -77,74 +77,75 @@ def deep_search_json(data):
         "sales_periods": [],
     }
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            # イベント名候補
-            if not extracted["title"]:
-                for t_key in ["title", "eventName", "name"]:
-                    if t_key in obj and isinstance(obj[t_key], str):
-                        t_val = obj[t_key].strip()
-                        if (
-                            t_val
-                            and "ticketdive" not in t_val.lower()
-                            and t_val != "販売情報"
-                        ):
-                            extracted["title"] = clean_title(t_val)
-                            break
+    try:
+        queries = (
+            data.get("props", {})
+            .get("pageProps", {})
+            .get("trpcState", {})
+            .get("json", {})
+            .get("queries", [])
+        )
 
-            # 開場・開演時刻候補
-            if not extracted["open_time"] and "openAt" in obj:
-                extracted["open_time"] = format_dt(obj["openAt"])
-            if not extracted["start_time"] and "startAt" in obj:
-                extracted["start_time"] = format_dt(obj["startAt"])
+        for query in queries:
+            state = query.get("state", {}).get("data", {})
+            if not isinstance(state, dict):
+                continue
 
-            # 公演日候補
-            if not extracted["event_date"]:
-                for d_key in ["eventDate", "date", "performanceDate"]:
-                    if d_key in obj and obj[d_key]:
-                        extracted["event_date"] = format_dt(obj[d_key])
-                        break
+            # イベント本体データの探索
+            event_data = state.get("event") or state
+            if isinstance(event_data, dict):
+                if event_data.get("name") and not result["title"]:
+                    result["title"] = clean_title(event_data.get("name"))
 
-            # 販売期間候補
-            s_start = (
-                obj.get("salesStartAt")
-                or obj.get("sales_start_at")
-                or obj.get("startAt")
-            )
-            s_end = (
-                obj.get("salesEndAt")
-                or obj.get("sales_end_at")
-                or obj.get("endAt")
-            )
-            if (
-                s_start
-                and s_end
-                and ("sales" in str(obj).lower() or "ticket" in str(obj).lower())
-            ):
-                fmt_s = format_dt(s_start)
-                fmt_e = format_dt(s_end)
-                if fmt_s and fmt_e:
-                    ticket_name = (
-                        obj.get("name") or obj.get("ticketName") or ""
+                if event_data.get("openAt") and not result["open_time"]:
+                    result["open_time"] = format_dt(event_data.get("openAt"))
+
+                if event_data.get("startAt") and not result["start_time"]:
+                    result["start_time"] = format_dt(event_data.get("startAt"))
+
+                if event_data.get("eventDate") and not result["event_date"]:
+                    result["event_date"] = format_dt(
+                        event_data.get("eventDate")
                     )
-                    prefix = f"【{ticket_name}】" if ticket_name else ""
-                    period = f"{prefix}{fmt_s} ～ {fmt_e}"
-                    if period not in extracted["sales_periods"]:
-                        extracted["sales_periods"].append(period)
+                elif event_data.get("startAt") and not result["event_date"]:
+                    # startAtから日付部分のみを取得
+                    st_fmt = format_dt(event_data.get("startAt"))
+                    if st_fmt and "（" in st_fmt:
+                        result["event_date"] = st_fmt.split("）")[0] + "）"
 
-            for v in obj.values():
-                walk(v)
+            # チケット情報・販売期間の探索
+            ticket_types = state.get("ticketTypes") or state.get(
+                "tickets", []
+            )
+            if isinstance(ticket_types, list):
+                for t in ticket_types:
+                    if isinstance(t, dict):
+                        s_start = t.get("salesStartAt") or t.get(
+                            "sales_start_at"
+                        )
+                        s_end = t.get("salesEndAt") or t.get("sales_end_at")
+                        t_name = (
+                            t.get("name")
+                            or t.get("title")
+                            or t.get("ticketName")
+                            or ""
+                        )
 
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
+                        if s_start and s_end:
+                            fmt_s = format_dt(s_start)
+                            fmt_e = format_dt(s_end)
+                            prefix = f"【{t_name}】" if t_name else ""
+                            period = f"{prefix}{fmt_s} ～ {fmt_e}"
+                            if period not in result["sales_periods"]:
+                                result["sales_periods"].append(period)
+    except Exception as e:
+        print(f"tRPC解析中の軽微なエラー: {e}")
 
-    walk(data)
-    return extracted
+    return result
 
 
 def fetch_event_details(event_url, headers):
-    """個別ページのHTMLおよび内部JSON構造から情報を徹底抽出"""
+    """個別イベントページの取得および多角解析"""
     try:
         res = requests.get(event_url, headers=headers, timeout=10)
         if res.status_code != 200:
@@ -161,42 +162,38 @@ def fetch_event_details(event_url, headers):
             "sales_periods": [],
         }
 
-        # 1. __NEXT_DATA__ スクリプトタグからのJSONディープサーチ
+        # 1. __NEXT_DATA__ (tRPC解析)
         script_tag = soup.find("script", id="__NEXT_DATA__")
         if script_tag and script_tag.string:
             try:
                 json_data = json.loads(script_tag.string)
-                json_res = deep_search_json(json_data)
+                trpc_res = extract_from_trpc(json_data)
 
-                if json_res["title"]:
-                    extracted["title"] = json_res["title"]
-                if json_res["event_date"]:
-                    extracted["event_date"] = json_res["event_date"]
-                if json_res["open_time"]:
-                    extracted["open_time"] = json_res["open_time"]
-                if json_res["start_time"]:
-                    extracted["start_time"] = json_res["start_time"]
-                if json_res["sales_periods"]:
-                    extracted["sales_periods"] = json_res["sales_periods"]
+                if trpc_res["title"]:
+                    extracted["title"] = trpc_res["title"]
+                if trpc_res["event_date"]:
+                    extracted["event_date"] = trpc_res["event_date"]
+                if trpc_res["open_time"]:
+                    extracted["open_time"] = trpc_res["open_time"]
+                if trpc_res["start_time"]:
+                    extracted["start_time"] = trpc_res["start_time"]
+                if trpc_res["sales_periods"]:
+                    extracted["sales_periods"] = trpc_res["sales_periods"]
             except Exception as e:
-                print(f"JSON解析警告 ({event_url}): {e}")
+                print(f"JSONパースエラー ({event_url}): {e}")
 
-        # 2. HTMLフォールバック（JSONで取得できなかった項目の補完）
-        if extracted["title"] == "イベント名称未設定":
-            h1_el = soup.find("h1")
-            if h1_el and "販売情報" not in h1_el.get_text():
-                extracted["title"] = clean_title(h1_el.get_text(strip=True))
+        # 2. og:title / meta タグからのタイトル補完（JSON解析で漏れた場合）
+        if (
+            extracted["title"] == "イベント名称未設定"
+            or extracted["title"] == ""
+        ):
+            og_title = soup.find("meta", property="og:title")
+            if og_title and og_title.get("content"):
+                extracted["title"] = clean_title(
+                    og_title["content"].split("｜")[0].split(" - ")[0]
+                )
 
-        # 公演日の正規表現補完
-        if extracted["event_date"] == "情報なし":
-            date_match = re.search(
-                r"(\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}月\d{1,2}日|\d{1,2}/\d{1,2}\s*[\(（].+?[\)）])",
-                page_text,
-            )
-            if date_match:
-                extracted["event_date"] = date_match.group(1).strip()
-
-        # 開場・開演時刻の正規表現補完
+        # 3. テキスト正規表現によるフォールバック補完
         if extracted["open_time"] == "情報なし":
             open_m = re.search(
                 r"(?:開場|OPEN)[\s:：]*(\d{1,2}:\d{2})", page_text, re.IGNORECASE
@@ -211,7 +208,6 @@ def fetch_event_details(event_url, headers):
             if start_m:
                 extracted["start_time"] = start_m.group(1).strip()
 
-        # 販売期間の正規表現補完
         if not extracted["sales_periods"]:
             sales_m = re.findall(
                 r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
