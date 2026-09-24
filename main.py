@@ -12,43 +12,58 @@ LINE_GROUP_ID = os.getenv("LINE_GROUP_ID")
 
 
 def fetch_event_details(event_url, headers):
-    """個別イベントページから「イベント名」「チケ発時間」「会場」を取得する関数"""
+    """個別イベントページから「短くてシンプルなイベント名」「チケ発時間」「会場」を取得する"""
     try:
         res = requests.get(event_url, headers=headers, timeout=10)
         if res.status_code != 200:
-            return {"title": "（取得失敗）", "ticket_time": "不明", "venue": "不明"}
+            return {"title": "イベント", "ticket_time": "詳細ページ参照", "venue": "詳細ページ参照"}
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 1. イベント名取得
+        # 1. イベント名（タイトル）のクレンジング
+        title = "イベント"
         title_el = soup.find("h1") or soup.find("h2")
-        title = title_el.get_text(strip=True) if title_el else "タイトル不明"
+        if title_el:
+            raw_title = title_el.get_text(strip=True)
+            
+            # 出演者一覧などの区切り文字（「/」「【出演】」「出演:」など）があれば、それ以降を削る
+            # 改行や長すぎるテキストも切り落とす
+            cleaned = re.split(r'(?:/|／|【出演】|出演[：:]|@|［出演］)', raw_title)[0].strip()
+            
+            # 50文字を超えるような場合は短縮
+            if len(cleaned) > 50:
+                cleaned = cleaned[:47] + "..."
+            
+            if cleaned:
+                title = cleaned
 
-        # 2. 会場名の取得
-        venue = "会場情報なし"
-        # ページ内のテキストや特定のタグから会場らしき場所を探す
+        # 2. 会場名の取得（主要ライブハウス名を判定）
         page_text = soup.get_text()
-        venue_match = re.search(r"(?:会場|場所|LIVE HOUSE|@)[\s:：]*([^\n\r]+)", page_text)
-        if venue_match:
-            venue = venue_match.group(1).strip()
-        else:
-            # アイコンや要素のキーワード検索
-            for el in soup.find_all(["p", "div", "span"]):
-                txt = el.get_text(strip=True)
-                if any(k in txt for k in ["ホール", "ライブハウス", "ビル", "Club", "CLUB", "劇場", "ReNY", "WWW", "キネマ"]):
-                    if len(txt) < 30:
-                        venue = txt
-                        break
+        venue = "詳細ページ参照"
+        
+        # 会場キーワード判定
+        venue_patterns = [
+            r'(?:会場|場所|LIVE HOUSE|@)[\s:：]*([^\n\r/／]+)',
+            r'([^\s]+(?:ホール|ライブハウス|ビル|Club|CLUB|劇場|ReNY|WWW|キネマ|O-EAST|O-WEST|O-Crest|O-nest|Veats|SPACE|LOFT|DIVE|GARDEN|HALL|G2|G3|G4|G7)))'
+        ]
+        
+        for pat in venue_patterns:
+            v_match = re.search(pat, page_text)
+            if v_match:
+                candidate = v_match.group(1).strip()
+                if 2 <= len(candidate) <= 25 and not any(x in candidate for x in ["http", "チケット", "受付"]):
+                    venue = candidate
+                    break
 
-        # 3. チケ発時間の取得（受付中か、日付指定か）
-        ticket_time = "詳細ページをご確認ください"
+        # 3. チケ発時間の取得（受付中か、日時表示か）
+        ticket_time = "詳細ページ参照"
         if "受付中" in page_text or "販売中" in page_text:
             ticket_time = "申込受付中"
         else:
-            # ○/○(○) ○:○ 形式の日時パターンを探す
-            date_match = re.search(r"(\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]\s*\d{1,2}:\d{2}\s*～?)", page_text)
+            # ○/○(○) ○:○ 形式の日時パターン
+            date_match = re.search(r"(\d{1,2}/\d{1,2}\s*[\(（].+?[\)）]\s*\d{1,2}:\d{2}(?:\s*～)?)", page_text)
             if date_match:
-                ticket_time = date_match.group(1)
+                ticket_time = date_match.group(1).strip()
 
         return {
             "title": title,
@@ -57,7 +72,7 @@ def fetch_event_details(event_url, headers):
         }
     except Exception as e:
         print(f"詳細取得エラー ({event_url}): {e}")
-        return {"title": "（取得エラー）", "ticket_time": "不明", "venue": "不明"}
+        return {"title": "イベント", "ticket_time": "詳細ページ参照", "venue": "詳細ページ参照"}
 
 
 def fetch_events():
@@ -78,7 +93,6 @@ def fetch_events():
         if "/events/" in href or "/event/" in href:
             full_url = href if href.startswith("http") else f"https://ticketdive.com{href}"
             if full_url not in [e["url"] for e in events]:
-                # 各イベントの個別ページを開いて詳細情報をスクレイピング
                 details = fetch_event_details(full_url, headers)
                 events.append({
                     "url": full_url,
@@ -132,7 +146,6 @@ def main():
     if new_events:
         print(f"{len(new_events)} 件の新着イベントを検知しました。LINEに送信します。")
 
-        # LINEの文字数制限対策で3件ずつ送信
         chunk_size = 3
         for i in range(0, len(new_events), chunk_size):
             chunk = new_events[i : i + chunk_size]
@@ -158,4 +171,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
