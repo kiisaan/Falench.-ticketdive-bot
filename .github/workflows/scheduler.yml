@@ -24,11 +24,10 @@ jobs:
         with:
           python-version: '3.10'
 
-     - name: 必要なライブラリのインストール
+       - name: 必要なライブラリのインストール
         run: |
           pip install requests beautifulsoup4 playwright
           playwright install chromium --with-deps
-        
 
       - name: 履歴リセット（手動実行でチェックを入れた場合）
         if: github.event.inputs.reset_history == 'true'
