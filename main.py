@@ -19,7 +19,6 @@ def clean_title(raw_title):
 
     title = re.sub(r"[\r\n]+", " ", str(raw_title)).strip()
 
-    # 画面上のボタ言や汎用ラベルを除外
     ng_words = [
         "お気に入り",
         "シェア",
@@ -49,87 +48,119 @@ def clean_title(raw_title):
     return title
 
 
-def parse_iso_dt(iso_str):
-    """ISO8601文字列（2026-09-27T10:30:00Z など）から (日付文字列, 時刻文字列) を返す"""
-    if not iso_str:
+def parse_datetime_value(val):
+    """ISO文字列またはUnixタイムスタンプ(数値/文字列)から (日付, 時刻) を抽出"""
+    if not val:
         return None, None
 
+    # エスケープ文字を除去
+    clean_val = str(val).replace("\\", "").replace('"', "").strip()
+
+    # 1. 数値（ミリ秒タイムスタンプ）の場合
+    if clean_val.isdigit():
+        try:
+            ts = float(clean_val)
+            if ts > 10000000000:  # ミリ秒判定
+                ts /= 1000.0
+            dt = datetime.fromtimestamp(ts)
+            weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+            return (
+                f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）",
+                f"{dt.hour:02d}:{dt.minute:02d}",
+            )
+        except Exception:
+            pass
+
+    # 2. ISO 8601 文字列の場合
     try:
-        clean_iso = str(iso_str).replace("\\", "").replace('"', "").strip()
-        clean_iso = clean_iso.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(clean_iso)
-
+        iso_str = clean_val.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso_str)
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-        date_part = f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）"
-        time_part = f"{dt.hour:02d}:{dt.minute:02d}"
-
-        return date_part, time_part
+        return (
+            f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）",
+            f"{dt.hour:02d}:{dt.minute:02d}",
+        )
     except Exception:
-        return None, None
+        pass
+
+    return None, None
 
 
-def parse_app_router_data(html_content):
-    """Next.js App RouterのエスケープされたJSONストリーミングデータを解析"""
+def extract_dynamic_fields(html_content):
+    """HTML / Next.jsデータ全域から正規表現パターンで各種フィールドを検出"""
     extracted = {
-        "title": None,
         "event_date": None,
         "open_time": None,
         "start_time": None,
         "sales_periods": [],
     }
 
-    # 1. タイトル抽出
-    name_matches = re.findall(r'\\"name\\"\s*:\s*\\"([^"\\]+)\\"', html_content)
-    for n in name_matches:
-        cand = clean_title(n)
-        if cand and cand not in [
-            "名前",
-            "チケット",
-            "一般",
-            "優先",
-            "前方",
-            "VIP",
-        ]:
-            extracted["title"] = cand
-            break
+    # --- A. 開場時間（open_at, openAt, open_time, openTime など） ---
+    open_patterns = [
+        r'\\?["\'](?:open_at|openAt|open_time|openTime)\\?["\']\s*:\s*\\?["\']?([^"\'\\,{}]+)\\?["\']?',
+        r'(?:開場|OPEN)[\s:：]*(\d{1,2}:\d{2})',
+    ]
+    for pat in open_patterns:
+        m = re.search(pat, html_content, re.IGNORECASE)
+        if m:
+            raw_val = m.group(1).strip()
+            d_str, t_str = parse_datetime_value(raw_val)
+            if d_str and not extracted["event_date"]:
+                extracted["event_date"] = d_str
+            if t_str:
+                extracted["open_time"] = t_str
+            elif re.match(r"^\d{1,2}:\d{2}$", raw_val):
+                extracted["open_time"] = raw_val
+            if extracted["open_time"]:
+                break
 
-    # 2. 開場（openAt）の解析 -> 公演日 & 開場時刻
-    open_match = re.search(r'\\"openAt\\"\s*:\s*\\"([^"\\]+)\\"', html_content)
-    if open_match:
-        d_str, t_str = parse_iso_dt(open_match.group(1))
-        if d_str:
-            extracted["event_date"] = d_str
-        if t_str:
-            extracted["open_time"] = t_str
+    # --- B. 開演時間（start_at, startAt, start_time, startTime など） ---
+    start_patterns = [
+        r'\\?["\'](?:start_at|startAt|start_time|startTime)\\?["\']\s*:\s*\\?["\']?([^"\'\\,{}]+)\\?["\']?',
+        r'(?:開演|START)[\s:：]*(\d{1,2}:\d{2})',
+    ]
+    for pat in start_patterns:
+        m = re.search(pat, html_content, re.IGNORECASE)
+        if m:
+            raw_val = m.group(1).strip()
+            d_str, t_str = parse_datetime_value(raw_val)
+            if d_str and not extracted["event_date"]:
+                extracted["event_date"] = d_str
+            if t_str:
+                extracted["start_time"] = t_str
+            elif re.match(r"^\d{1,2}:\d{2}$", raw_val):
+                extracted["start_time"] = raw_val
+            if extracted["start_time"]:
+                break
 
-    # 3. 開演（startAt）の解析 -> 公演日（補完） & 開演時刻
-    start_match = re.search(r'\\"startAt\\"\s*:\s*\\"([^"\\]+)\\"', html_content)
-    if start_match:
-        d_str, t_str = parse_iso_dt(start_match.group(1))
-        if not extracted["event_date"] and d_str:
-            extracted["event_date"] = d_str
-        if t_str:
-            extracted["start_time"] = t_str
+    # --- C. 販売期間（sales_start_at / sales_end_at のペア抽出） ---
+    sales_patterns = [
+        # スネークケース / キャメルケースペア
+        r'\\?["\'](?:sales_start_at|salesStartAt|sales_start|salesStart)\\?["\']\s*:\s*\\?["\']?([^"\'\\,{}]+)\\?["\']?.*?\\?["\'](?:sales_end_at|salesEndAt|sales_end|salesEnd)\\?["\']\s*:\s*\\?["\']?([^"\'\\,{}]+)\\?["\']?',
+        # テキスト表現（例: 09/20(日)10:00 ～ 09/27(日)10:30）
+        r'(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})',
+    ]
 
-    # 4. チケット販売期間の抽出 (salesStartAt ~ salesEndAt)
-    sales_matches = re.findall(
-        r'\\"salesStartAt\\"\s*:\s*\\"([^"\\]+)\\"[^\}]*?\\"salesEndAt\\"\s*:\s*\\"([^"\\]+)\\"',
-        html_content,
-    )
-    for s_start, s_end in sales_matches:
-        d1, t1 = parse_iso_dt(s_start)
-        d2, t2 = parse_iso_dt(s_end)
-
-        if d1 and t1 and d2 and t2:
-            period = f"{d1}{t1} ～ {d2}{t2}"
-            if period not in extracted["sales_periods"]:
-                extracted["sales_periods"].append(period)
+    for pat in sales_patterns:
+        matches = re.findall(pat, html_content, re.DOTALL | re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple) and len(match) == 2:
+                s_start, s_end = match
+                d1, t1 = parse_datetime_value(s_start)
+                d2, t2 = parse_datetime_value(s_end)
+                if d1 and t1 and d2 and t2:
+                    period = f"{d1}{t1} ～ {d2}{t2}"
+                    if period not in extracted["sales_periods"]:
+                        extracted["sales_periods"].append(period)
+            elif isinstance(match, str) and match.strip():
+                if match.strip() not in extracted["sales_periods"]:
+                    extracted["sales_periods"].append(match.strip())
 
     return extracted
 
 
 def fetch_event_details(event_url, headers):
-    """個別イベントページの取得と多角解析"""
+    """個別イベントページの取得と解析"""
     try:
         res = requests.get(event_url, headers=headers, timeout=10)
         if res.status_code != 200:
@@ -147,47 +178,26 @@ def fetch_event_details(event_url, headers):
             "sales_periods": [],
         }
 
-        # 1. og:title メタタグからタイトルを優先取得
+        # 1. og:title メタタグからタイトルを取得
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             cand_og = clean_title(og_title["content"])
             if cand_og:
                 extracted["title"] = cand_og
 
-        # 2. Next.js App Routerのストリーミングデータを解読
-        app_res = parse_app_router_data(html)
+        # 2. HTMLおよびデータ構造から時刻・日付・販売期間を解析
+        dynamic_res = extract_dynamic_fields(html)
 
-        if (
-            extracted["title"] == "イベント名称未設定"
-            and app_res["title"]
-        ):
-            extracted["title"] = app_res["title"]
+        if dynamic_res["event_date"]:
+            extracted["event_date"] = dynamic_res["event_date"]
+        if dynamic_res["open_time"]:
+            extracted["open_time"] = dynamic_res["open_time"]
+        if dynamic_res["start_time"]:
+            extracted["start_time"] = dynamic_res["start_time"]
+        if dynamic_res["sales_periods"]:
+            extracted["sales_periods"] = dynamic_res["sales_periods"]
 
-        if app_res["event_date"]:
-            extracted["event_date"] = app_res["event_date"]
-        if app_res["open_time"]:
-            extracted["open_time"] = app_res["open_time"]
-        if app_res["start_time"]:
-            extracted["start_time"] = app_res["start_time"]
-        if app_res["sales_periods"]:
-            extracted["sales_periods"] = app_res["sales_periods"]
-
-        # 3. テキストからの補完処理
-        if extracted["open_time"] == "情報なし":
-            open_m = re.search(
-                r"(?:開場|OPEN)[\s:：]*(\d{1,2}:\d{2})", page_text, re.IGNORECASE
-            )
-            if open_m:
-                extracted["open_time"] = open_m.group(1).strip()
-
-        if extracted["start_time"] == "情報なし":
-            start_m = re.search(
-                r"(?:開演|START)[\s:：]*(\d{1,2}:\d{2})", page_text, re.IGNORECASE
-            )
-            if start_m:
-                extracted["start_time"] = start_m.group(1).strip()
-
-        # 公演日のテキスト補完
+        # 3. テキスト全域からの最終フォールバック
         if extracted["event_date"] == "情報なし":
             date_m = re.search(
                 r"(\d{1,2}/\d{1,2}\s*[\(（][月火水木金土日祝][\)）])", page_text
@@ -195,16 +205,8 @@ def fetch_event_details(event_url, headers):
             if date_m:
                 extracted["event_date"] = date_m.group(1).strip()
 
-        # 販売期間のテキスト補完
         if not extracted["sales_periods"]:
-            sales_m = re.findall(
-                r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
-                page_text,
-            )
-            if sales_m:
-                extracted["sales_periods"] = list(set(sales_m))
-            else:
-                extracted["sales_periods"] = ["公式ページをご確認ください"]
+            extracted["sales_periods"] = ["公式ページをご確認ください"]
 
         extracted["url"] = event_url
         return extracted
