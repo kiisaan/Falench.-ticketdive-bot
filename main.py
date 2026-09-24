@@ -35,24 +35,62 @@ def clean_title(raw_title):
     return title.strip(" :：-–|/／")
 
 
+def extract_sales_periods_from_json(html_content):
+    """Next.jsの組み込みJSONデータ(__NEXT_DATA__)から販売期間をダイレクト抽出"""
+    periods = []
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        script_tag = soup.find("script", id="__NEXT_DATA__")
+        if script_tag and script_tag.string:
+            data = json.loads(script_tag.string)
+            # 再帰的に salesStartAt / salesEndAt を探索
+            def find_dates(obj):
+                if isinstance(obj, dict):
+                    if "salesStartAt" in obj or "salesEndAt" in obj:
+                        start = obj.get("salesStartAt", "")
+                        end = obj.get("salesEndAt", "")
+                        name = obj.get("name", "チケット")
+                        if start or end:
+                            # ISO8601フォーマット等を読みやすい形式に簡易整形
+                            s_fmt = start.replace("T", " ")[:16] if start else ""
+                            e_fmt = end.replace("T", " ")[:16] if end else ""
+                            period_str = f"{name}: {s_fmt} ～ {e_fmt}".strip(" ～")
+                            if period_str not in periods:
+                                periods.append(period_str)
+                    for v in obj.values():
+                        find_dates(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        find_dates(item)
+
+            find_dates(data)
+    except Exception as e:
+        print(f"JSON解析エラー: {e}")
+    return periods
+
+
 def fetch_event_details_with_browser(event_url):
-    """Playwrightを使って実際にブラウザでページを開き、動的に描画された販売期間を取得"""
+    """Playwrightを使ってブラウザ上で動的読み込み完了まで待機し、販売期間を精密抽出"""
     try:
         with sync_playwright() as p:
-            # ヘッドレスブラウザの起動
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
-            # ページへアクセスし、ネットワーク通信が落ち着くまで待機
-            page.goto(event_url, wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(3000)  # Reactの描画完了まで3秒追加待機
+            # ページアクセス
+            page.goto(event_url, wait_until="domcontentloaded", timeout=30000)
 
-            # タイトルの取得
+            # TicketDiveの動的コンテンツ描画を待機（最大10秒）
+            try:
+                page.wait_for_selector("text=/販売|受付|～|~/i", timeout=10000)
+            except Exception:
+                page.wait_for_timeout(4000)
+
+            # タイトル取得
             title = "イベント名称未設定"
             try:
-                h1_element = page.query_selector("h1")
-                if h1_element:
-                    title = clean_title(h1_element.inner_text())
+                h1_elem = page.query_selector("h1")
+                if h1_elem:
+                    title = clean_title(h1_elem.inner_text())
             except Exception:
                 pass
 
@@ -63,34 +101,28 @@ def fetch_event_details_with_browser(event_url):
                 if og_title and og_title.get("content"):
                     title = clean_title(og_title["content"])
 
-            # 画面上のテキスト全取得
             body_text = page.inner_text("body")
-            lines = [line.strip() for line in body_text.splitlines() if line.strip()]
-
             sales_periods = []
-            
-            # 販売期間・チケット情報の解析
-            for i, line in enumerate(lines):
-                # 販売期間・受付期間に関連するキーワードを探す
-                if any(kw in line for kw in ["販売期間", "受付期間", "販売:", "受付:", "先着", "抽選"]):
-                    # 該当行とその前後数行をまとめてテキスト化
-                    start_idx = max(0, i - 1)
-                    end_idx = min(len(lines), i + 4)
-                    block = " ".join(lines[start_idx:end_idx])
 
-                    # 日時フォーマットパターン（例: 2026/09/01(火) 12:00 ～ 2026/09/10(木) 23:59）
-                    matches = re.findall(
-                        r"(\d{4}[/\-]\d{1,2}[/\-]\d{1,2}[\s\S]*?\d{1,2}:\d{2}\s*[\~～\-–—]\s*(?:\d{4}[/\-])?\d{1,2}[/\-]\d{1,2}[\s\S]*?\d{1,2}:\d{2})",
-                        block
-                    )
-                    for m in matches:
-                        clean_m = re.sub(r"\s+", " ", m).strip()
-                        if clean_m not in sales_periods:
-                            sales_periods.append(clean_m)
+            # 方法1: テキストからの正規表現マッチング
+            # 例: 2026/09/01 12:00 ～ 2026/09/10 23:59 や 09/01(月) 12:00 ~ 09/10(水) 23:59
+            pattern = r"(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}[\s\S]*?\d{1,2}:\d{2}\s*[\~～\-–—]\s*(?:\d{4}[/\.-])?\d{1,2}[/\.-]\d{1,2}[\s\S]*?\d{1,2}:\d{2})"
+            matches = re.findall(pattern, body_text)
+            
+            for m in matches:
+                clean_m = re.sub(r"\s+", " ", m).strip()
+                # 余計な長文をカット
+                if len(clean_m) < 80 and clean_m not in sales_periods:
+                    sales_periods.append(clean_m)
+
+            # 方法2: テキストで取れなかった場合、内部JSONから抽出
+            if not sales_periods:
+                html_content = page.content()
+                sales_periods = extract_sales_periods_from_json(html_content)
 
             # 公演日時の抽出
             event_date = "情報なし"
-            m_date = re.search(r"(\d{4}[/\-]\d{1,2}[/\-]\d{1,2}|\d{1,2}月\d{1,2}日)", body_text)
+            m_date = re.search(r"(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}|\d{1,2}月\d{1,2}日)", body_text)
             if m_date:
                 event_date = m_date.group(1)
 
@@ -102,7 +134,7 @@ def fetch_event_details_with_browser(event_url):
             return {
                 "title": title if title else "イベント名称未設定",
                 "event_date": event_date,
-                "sales_periods": sales_periods[:3],  # 最大3件まで表示
+                "sales_periods": sales_periods[:4],  # 最大4件
                 "url": event_url
             }
 
@@ -143,17 +175,19 @@ def fetch_events():
 
 
 def load_seen_events():
+    """既読リストを安全に読み込み（空ファイル対応）"""
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-                if not content:  # ファイルが空の場合
+                if not content:
                     return set()
                 return set(json.loads(content))
-        except json.JSONDecodeError:
-            print("seen_events.json の読み込みに失敗したため、空のリストで初期化します。")
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"seen_events.json 読み込みスキップ: {e}")
             return set()
     return set()
+
 
 def save_seen_events(seen_set):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
