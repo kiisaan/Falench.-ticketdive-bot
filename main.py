@@ -1,7 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import re
+import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
@@ -10,6 +11,8 @@ DATA_FILE = "seen_events.json"
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_GROUP_ID = os.getenv("LINE_GROUP_ID")
+
+JST = timezone(timedelta(hours=9))
 
 
 def clean_title(raw_title):
@@ -49,22 +52,31 @@ def clean_title(raw_title):
 
 
 def format_dt(dt_input):
-    """日付・時刻表現を「MM/DD（曜日）HH:MM」または「MM/DD（曜日）」等に整形"""
+    """日付・時刻表現を「MM/DD（曜日）HH:MM」等に整形"""
     if not dt_input:
         return None
 
     dt_str = str(dt_input).strip().replace("\\", "").replace('"', "")
 
-    # ISO 8601 または タイムスタンプ処理
+    # 13桁のミリ秒タイムスタンプ
+    if dt_str.isdigit() and len(dt_str) == 13:
+        try:
+            dt = datetime.fromtimestamp(int(dt_str) / 1000, tz=JST)
+            weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+            return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
+        except Exception:
+            pass
+
+    # ISO 8601
     try:
         clean_iso = dt_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(clean_iso)
+        dt = datetime.fromisoformat(clean_iso).astimezone(JST)
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
         return f"{dt.month:02d}/{dt.day:02d}（{weekdays[dt.weekday()]}）{dt.hour:02d}:{dt.minute:02d}"
     except Exception:
         pass
 
-    # YYYY/MM/DD や YYYY-MM-DD
+    # YYYY/MM/DD または YYYY-MM-DD
     m_date = re.search(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})", dt_str)
     if m_date:
         try:
@@ -82,44 +94,94 @@ def format_dt(dt_input):
     return dt_str
 
 
-def extract_periods_from_dict(data):
-    """JSON辞書オブジェクトを深く走査してチケットの販売期間を取得"""
+def parse_raw_html_for_dates(html):
+    """HTML全文字列からISO日時ペア・タイムスタンプペアを強力抽出"""
     periods = []
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            # TicketDiveのJSON構造におけるキー名を広範囲にカバー
-            s_start = (
-                obj.get("salesStartAt")
-                or obj.get("sales_start_at")
-                or obj.get("salesStart")
-                or obj.get("validFrom")
-            )
-            s_end = (
-                obj.get("salesEndAt")
-                or obj.get("sales_end_at")
-                or obj.get("salesEnd")
-                or obj.get("validThrough")
-            )
-            t_name = obj.get("name") or obj.get("title") or ""
+    # パターン1: ISO日時のペア（"2026-08-28T13:00:00.000Z" 等）
+    iso_pattern = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+\d{2}:\d{2})?"
+    found_isos = re.findall(iso_pattern, html)
 
-            if s_start and s_end:
-                fmt_s = format_dt(s_start)
-                fmt_e = format_dt(s_end)
-                if fmt_s and fmt_e:
-                    prefix = f"【{t_name}】" if t_name and len(str(t_name)) < 25 else ""
-                    period = f"{prefix}{fmt_s} ～ {fmt_e}"
-                    if period not in periods:
-                        periods.append(period)
+    if len(found_isos) >= 2:
+        # ペアを作成して整形
+        for i in range(0, len(found_isos) - 1, 2):
+            s_fmt = format_dt(found_isos[i])
+            e_fmt = format_dt(found_isos[i + 1])
+            if s_fmt and e_fmt:
+                p = f"{s_fmt} ～ {e_fmt}"
+                if p not in periods:
+                    periods.append(p)
 
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
+    # パターン2: 日本語表記（例: 08/28(金)22:00 ～ 09/27(日)10:30）
+    sales_m = re.findall(
+        r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
+        html,
+    )
+    for m in sales_m:
+        if m not in periods:
+            periods.append(m)
 
-    walk(data)
     return periods
+
+
+def fetch_api_details(event_slug, headers):
+    """tRPC APIから正確なチケット情報を直接取得"""
+    input_param = urllib.parse.quote(f'{{"json":{{"slug":"{event_slug}"}}}}')
+    api_url = f"https://ticketdive.com/api/trpc/event.getBySlug?input={input_param}"
+
+    api_headers = headers.copy()
+    api_headers.update(
+        {
+            "x-trpc-source": "nextjs-react",
+            "Referer": f"https://ticketdive.com/event/{event_slug}",
+        }
+    )
+
+    try:
+        res = requests.get(api_url, headers=api_headers, timeout=8)
+        if res.status_code == 200:
+            periods = parse_raw_html_for_dates(res.text)
+
+            # JSONデータからチケット種別ごとの抽出
+            try:
+                data = res.json()
+                result_data = (
+                    data.get("result", {})
+                    .get("data", {})
+                    .get("json", {})
+                )
+                tickets = result_data.get("ticketTypes", []) or result_data.get(
+                    "tickets", []
+                )
+
+                for t in tickets:
+                    t_name = t.get("name", "")
+                    s_start = (
+                        t.get("salesStartAt")
+                        or t.get("sales_start_at")
+                        or t.get("startAt")
+                    )
+                    s_end = (
+                        t.get("salesEndAt")
+                        or t.get("sales_end_at")
+                        or t.get("endAt")
+                    )
+
+                    if s_start and s_end:
+                        fmt_s = format_dt(s_start)
+                        fmt_e = format_dt(s_end)
+                        prefix = f"【{t_name}】" if t_name else ""
+                        p = f"{prefix}{fmt_s} ～ {fmt_e}"
+                        if p not in periods:
+                            periods.append(p)
+            except Exception:
+                pass
+
+            return periods
+    except Exception as e:
+        print(f"API取得失敗 ({event_slug}): {e}")
+
+    return []
 
 
 def fetch_event_details(event_url, headers):
@@ -157,51 +219,22 @@ def fetch_event_details(event_url, headers):
             if m_date:
                 extracted["event_date"] = format_dt(m_date.group(1))
 
-        # 3. Next.jsの埋め込みデータ（__NEXT_DATA__）から最優先で抽出
-        next_data_script = soup.find("script", id="__NEXT_DATA__")
-        if next_data_script and next_data_script.string:
-            try:
-                next_json = json.loads(next_data_script.string)
-                periods = extract_periods_from_dict(next_json)
-                if periods:
-                    extracted["sales_periods"] = periods
+        # 3. イベントslugの抽出とAPI直接リクエスト
+        event_slug = event_url.split("/event/")[-1].split("/")[0].split("?")[0]
+        api_periods = fetch_api_details(event_slug, headers)
+        if api_periods:
+            extracted["sales_periods"].extend(api_periods)
 
-                # 公演日の抽出補完
-                if extracted["event_date"] == "情報なし":
-                    event_date_m = re.search(
-                        r'"(?:eventDate|date)"\s*:\s*"([^"]+)"',
-                        next_data_script.string,
-                    )
-                    if event_date_m:
-                        extracted["event_date"] = format_dt(
-                            event_date_m.group(1)
-                        )
-            except Exception as e:
-                print(f"__NEXT_DATA__ 解析エラー ({event_url}): {e}")
-
-        # 4. JSON-LD スクリプトタグからの補完抽出
+        # 4. 生HTMLからの正規表現全探索（フォールバック）
         if not extracted["sales_periods"]:
-            json_ld_scripts = soup.find_all("script", type="application/ld+json")
-            for script in json_ld_scripts:
-                if script.string:
-                    try:
-                        ld_json = json.loads(script.string)
-                        periods = extract_periods_from_dict(ld_json)
-                        if periods:
-                            extracted["sales_periods"].extend(periods)
-                    except Exception:
-                        pass
+            html_periods = parse_raw_html_for_dates(html)
+            if html_periods:
+                extracted["sales_periods"].extend(html_periods)
 
-        # 5. 正規表現による文字列検索フォールバック
-        if not extracted["sales_periods"]:
-            sales_m = re.findall(
-                r"(\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2}\s*～\s*\d{1,2}/\d{1,2}\s*(?:[\(（].+?[\)）])?\s*\d{1,2}:\d{2})",
-                html,
-            )
-            if sales_m:
-                extracted["sales_periods"] = list(set(sales_m))
+        # 重複削除
+        extracted["sales_periods"] = list(dict.fromkeys(extracted["sales_periods"]))
 
-        # 最終フォールバック
+        # どうしても取得できない場合
         if not extracted["sales_periods"]:
             extracted["sales_periods"] = ["公式ページをご確認ください"]
 
