@@ -11,6 +11,7 @@ DATA_FILE = "seen_events.json"
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_GROUP_ID = os.getenv("LINE_GROUP_ID")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 JST = timezone(timedelta(hours=9))
 
@@ -44,7 +45,6 @@ def parse_datetime_str(raw_str):
         dt_jst = dt.astimezone(JST)
         return dt_jst.strftime("%Y/%m/%d %H:%M")
     except Exception:
-        # パースできない場合は文字列のまま整形
         return str(raw_str).replace("T", " ")[:16]
 
 
@@ -59,7 +59,6 @@ def extract_sales_periods_from_json(html_content):
 
             def search_tickets(obj):
                 if isinstance(obj, dict):
-                    # TicketDiveのチケットオブジェクト構造を直接参照
                     if "salesStartAt" in obj or "salesEndAt" in obj or "sales_start_at" in obj:
                         name = obj.get("name") or obj.get("title") or "チケット"
                         start = obj.get("salesStartAt") or obj.get("sales_start_at") or ""
@@ -86,23 +85,20 @@ def extract_sales_periods_from_json(html_content):
 
 
 def fetch_event_details_with_browser(event_url):
-    """PlaywrightでTicketDiveの分割要素(DOM)から販売期間を統合・抽出"""
+    """PlaywrightでTicketDiveの動的要素からイベント情報・販売期間を抽出"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
-            # ページ読み込み
             page.goto(event_url, wait_until="domcontentloaded", timeout=30000)
 
-            # 動的描画（React/Next.js）の待機
             try:
                 page.wait_for_selector("h1", timeout=8000)
             except Exception:
                 pass
             page.wait_for_timeout(3000)
 
-            # 1. タイトルの取得
             title = "イベント名称未設定"
             try:
                 h1_elem = page.query_selector("h1")
@@ -119,46 +115,30 @@ def fetch_event_details_with_browser(event_url):
                     title = clean_title(og_title["content"])
 
             sales_periods = []
-
-            # 2. 画面上の要素からチケット枠ごとに販売期間を取得
-            # 日時表記と思われるテキストが含まれる要素を探索
             body_text = page.inner_text("body")
             lines = [l.strip() for l in body_text.splitlines() if l.strip()]
 
-            # 日時を表す行のインデックスを探す
-            date_line_indices = []
-            for idx, line in enumerate(lines):
-                if re.search(r"\d{2,4}[/\.-]\d{1,2}[/\.-]\d{1,2}|\d{1,2}:\d{2}", line):
-                    date_line_indices.append(idx)
-
-            # 近接する日時行・チケット情報を統合して期間文字列を作成
             i = 0
             while i < len(lines):
                 line = lines[i]
-                # 「販売」「受付」「先着」「抽選」「～」「~」などが含まれるか検証
                 if any(k in line for k in ["販売", "受付", "先着", "抽選", "チケット"]):
-                    # 周辺5行のテキストを取得
                     chunk = lines[max(0, i-1):min(len(lines), i+6)]
                     chunk_text = " ".join(chunk)
 
-                    # chunk内に日時が2つ以上（開始と終了）含まれていれば抽出
                     dates_found = re.findall(r"(\d{2,4}[/\.-]\d{1,2}[/\.-]\d{1,2}(?:\(.*?\))?\s*\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日(?:\(.*?\))?\s*\d{1,2}:\d{2})", chunk_text)
                     if len(dates_found) >= 2:
                         period_candidate = f"{dates_found[0]} ～ {dates_found[1]}"
                         if period_candidate not in sales_periods:
                             sales_periods.append(period_candidate)
                     elif len(dates_found) == 1 and any(s in chunk_text for s in ["～", "~", "-"]):
-                        # 1つの文脈の中に範囲指定がある場合
                         if dates_found[0] not in sales_periods:
                             sales_periods.append(chunk_text)
                 i += 1
 
-            # 3. DOMから取得できなかった場合、内部JSON(__NEXT_DATA__)を探索
             if not sales_periods:
                 html_content = page.content()
                 sales_periods = extract_sales_periods_from_json(html_content)
 
-            # 4. 公演日時の抽出
             event_date = "情報なし"
             m_date = re.search(r"(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}|\d{1,2}月\d{1,2}日)", body_text)
             if m_date:
@@ -166,7 +146,6 @@ def fetch_event_details_with_browser(event_url):
 
             browser.close()
 
-            # 重複の削除と整理
             clean_periods = []
             for sp in sales_periods:
                 sp_clean = re.sub(r"\s+", " ", sp).strip()
@@ -179,7 +158,7 @@ def fetch_event_details_with_browser(event_url):
             return {
                 "title": title if title else "イベント名称未設定",
                 "event_date": event_date,
-                "sales_periods": clean_periods[:3],  # 最大3枠まで通知
+                "sales_periods": clean_periods[:3],
                 "url": event_url
             }
 
@@ -220,7 +199,7 @@ def fetch_events():
 
 
 def load_seen_events():
-    """既読リストの安全な読み込み"""
+    """既読リストの読み込み"""
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -240,6 +219,11 @@ def save_seen_events(seen_set):
 
 
 def send_line_message(message):
+    """LINEへの通知送信"""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_GROUP_ID:
+        print("LINEの設定（アクセストークン/グループID）が見つかりません。")
+        return
+
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Content-Type": "application/json",
@@ -251,8 +235,50 @@ def send_line_message(message):
     }
     res = requests.post(url, headers=headers, json=payload)
     if res.status_code != 200:
-        print(f"LINE送信エラー: {res.status_code}, {res.text}")
-        raise Exception("LINE送信失敗")
+        print(f"LINE送信失敗 ({res.status_code}): {res.text}")
+
+
+def send_discord_message(new_events):
+    """Discordへの通知送信（埋め込みカード形式）"""
+    if not DISCORD_WEBHOOK_URL:
+        print("Discord Webhook URL が設定されていません。スキップします。")
+        return
+
+    embeds = []
+    for ev in new_events:
+        sales_text = "\n".join(ev["sales_periods"])
+        embed = {
+            "title": ev["title"],
+            "url": ev["url"],
+            "color": 0x5865F2,  # ディスコードブルー
+            "fields": [
+                {
+                    "name": "⏰ 販売期間",
+                    "value": sales_text,
+                    "inline": False
+                },
+                {
+                    "name": "📅 公演日",
+                    "value": ev["event_date"],
+                    "inline": True
+                }
+            ],
+            "footer": {
+                "text": "TicketDive Falench. 新着通知"
+            }
+        }
+        embeds.append(embed)
+
+    # Discord Webhookは1回のリクエストで最大10個のEmbed（カード）まで送信可能
+    chunk_size = 10
+    for i in range(0, len(embeds), chunk_size):
+        payload = {
+            "content": "📢 **【Falench.】新着ライブ情報が届きました！**",
+            "embeds": embeds[i : i + chunk_size]
+        }
+        res = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        if res.status_code not in [200, 204]:
+            print(f"Discord送信失敗 ({res.status_code}): {res.text}")
 
 
 def main():
@@ -266,27 +292,41 @@ def main():
             seen.add(ev["url"])
 
     if new_events:
-        print(f"{len(new_events)} 件の新着イベントを検知しました。LINEに通知します。")
+        print(f"{len(new_events)} 件の新着イベントを検知しました。通知処理を行います。")
 
-        msg_blocks = []
-        for ev in new_events:
-            sales_text = "\n".join(ev["sales_periods"])
-            block_text = (
-                f"イベント名：{ev['title']}\n"
-                f"販売期間：{sales_text}\n"
-                f"公演日：{ev['event_date']}\n"
-                f"URL：{ev['url']}"
-            )
-            msg_blocks.append(block_text)
-
-        chunk_size = 2
-        for i in range(0, len(msg_blocks), chunk_size):
-            chunk = msg_blocks[i : i + chunk_size]
-            msg = "【Falench.ライブ情報（ダイブ）】\n\n"
-            msg += "\n\n──────────────────\n\n".join(chunk)
-            send_line_message(msg)
-
+        # 重複通知防止のため、通知送信前に既読リストを更新保存
         save_seen_events(seen)
+
+        # 1. Discord への通知送信
+        try:
+            send_discord_message(new_events)
+            print("Discordへ通知を送信しました。")
+        except Exception as e:
+            print(f"Discord通知処理エラー: {e}")
+
+        # 2. LINE への通知送信（エラーが起きても全体を停止させない）
+        try:
+            msg_blocks = []
+            for ev in new_events:
+                sales_text = "\n".join(ev["sales_periods"])
+                block_text = (
+                    f"イベント名：{ev['title']}\n"
+                    f"販売期間：{sales_text}\n"
+                    f"公演日：{ev['event_date']}\n"
+                    f"URL：{ev['url']}"
+                )
+                msg_blocks.append(block_text)
+
+            chunk_size = 2
+            for i in range(0, len(msg_blocks), chunk_size):
+                chunk = msg_blocks[i : i + chunk_size]
+                msg = "【Falench.ライブ情報（ダイブ）】\n\n"
+                msg += "\n\n──────────────────\n\n".join(chunk)
+                send_line_message(msg)
+            print("LINEへ通知を送信しました。")
+        except Exception as e:
+            print(f"LINE通知処理エラー: {e}")
+
     else:
         print("新着イベントはありませんでした。")
 
