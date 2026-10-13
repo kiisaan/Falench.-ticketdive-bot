@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-TARGET_URL = "https://ticketdive.com/artist/falench"
+TARGET_URL = "https://ticketdive.com/search?q=Falench"
 DATA_FILE = "seen_events.json"
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
