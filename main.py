@@ -6,6 +6,8 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
+import sheet_sync
+
 TARGET_URL = "https://ticketdive.com/search?q=Falench"
 DATA_FILE = "seen_events.json"
 
@@ -144,6 +146,18 @@ def fetch_event_details_with_browser(event_url):
             if m_date:
                 event_date = m_date.group(1)
 
+            # スプシ反映用：会場・公演日（date型）・販売開始日時
+            html_content = page.content()
+            text_lines = sheet_sync.clean_lines(body_text)
+            venue = sheet_sync.venue_from_lines(text_lines) or sheet_sync.venue_from_html(html_content)
+            event_day = (sheet_sync.event_date_from_lines(text_lines)
+                         or sheet_sync.event_date_from_html(html_content))
+            if event_day:
+                event_date = event_day.strftime("%Y/%m/%d")
+            release_at = (sheet_sync.parse_release_at(extract_sales_periods_from_json(html_content), event_day)
+                          or sheet_sync.parse_release_at(sales_periods, event_day))
+            print(f"  📍 会場: {venue or '（取得できず）'} / 公演日: {event_day} / チケ発: {release_at}")
+
             browser.close()
 
             clean_periods = []
@@ -159,7 +173,10 @@ def fetch_event_details_with_browser(event_url):
                 "title": title if title else "イベント名称未設定",
                 "event_date": event_date,
                 "sales_periods": clean_periods[:3],
-                "url": event_url
+                "url": event_url,
+                "venue": venue,
+                "event_date_obj": event_day,
+                "release_at": release_at,
             }
 
     except Exception as e:
@@ -262,7 +279,8 @@ def send_discord_message(new_events):
                     "value": ev["event_date"],
                     "inline": True
                 }
-            ],
+            ] + ([{"name": "📍 会場", "value": ev["venue"], "inline": True}] if ev.get("venue") else [])
+              + ([{"name": "📝 スプシ", "value": ev["sheet_status"], "inline": False}] if ev.get("sheet_status") else []),
             "footer": {
                 "text": "TicketDive Falench. 新着通知"
             }
@@ -297,6 +315,16 @@ def main():
         # 重複通知防止のため、通知送信前に既読リストを更新保存
         save_seen_events(seen)
 
+        # スプシへ反映し、その結果を通知に載せる（失敗しても通知は続ける）
+        try:
+            payload = [dict(ev, event_date=ev.get("event_date_obj")) for ev in new_events]
+            sheet_sync.sync_events_to_sheet(payload, source="TicketDive")
+            for ev, p in zip(new_events, payload):
+                if p.get("sheet_status"):
+                    ev["sheet_status"] = p["sheet_status"]
+        except Exception as e:
+            print(f"スプシ反映処理エラー: {e}")
+
         # 1. Discord への通知送信
         try:
             send_discord_message(new_events)
@@ -313,7 +341,9 @@ def main():
                     f"イベント名：{ev['title']}\n"
                     f"販売期間：{sales_text}\n"
                     f"公演日：{ev['event_date']}\n"
-                    f"URL：{ev['url']}"
+                    + (f"会場：{ev['venue']}\n" if ev.get("venue") else "")
+                    + f"URL：{ev['url']}"
+                    + (f"\n{ev['sheet_status']}" if ev.get("sheet_status") else "")
                 )
                 msg_blocks.append(block_text)
 
